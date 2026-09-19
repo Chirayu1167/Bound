@@ -1,25 +1,25 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ActiveTab, AgentNode, MandateItem, TransactionRecord, DelegationItem } from './types';
+import { ActiveTab, AgentNode, ApprovalItem, DelegationItem, MandateItem, MockPaymentItem, TaskItem, TransactionRecord } from './types';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
-import { OverviewView } from './views/OverviewView';
-import { MandatesView } from './views/MandatesView';
-import { PaymentVerificationView } from './views/PaymentVerificationView';
+import { HomeView } from './views/HomeView';
 import { AgentsView } from './views/AgentsView';
-import { DelegationsView } from './views/DelegationsView';
-import { SecurityViolationView } from './views/SecurityViolationView';
-import { SecurityAuditView } from './views/SecurityAuditView';
-import { ProofModal } from './components/ProofModal';
-import { PanicModal } from './components/PanicModal';
-import { CreateMandateModal } from './components/CreateMandateModal';
+import { RulesView } from './views/RulesView';
+import { ActivityView } from './views/ActivityView';
+import { AuditView } from './views/AuditView';
+import { PreferencesView } from './views/PreferencesView';
+import { TransactionDetailModal } from './components/TransactionDetailModal';
+import { CreateMandateModal, type MandateInitialValues } from './components/CreateMandateModal';
 import { RegisterAgentModal } from './components/RegisterAgentModal';
 import { CreateDelegationModal } from './components/CreateDelegationModal';
 import { EditLimitModal } from './components/EditLimitModal';
-import { CommandPaletteModal } from './components/CommandPaletteModal';
+import { SetupDomainDialog, type SetupDomainValues } from './components/SetupDomainDialog';
+import type { TaskCheckInput } from './components/TaskCard';
+import { DOMAINS, type DomainId } from './domains';
 import * as api from './services/api';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [agents, setAgents] = useState<AgentNode[]>([]);
   const [mandates, setMandates] = useState<MandateItem[]>([]);
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
@@ -27,17 +27,18 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [backendLive, setBackendLive] = useState<boolean | null>(null);
 
-  // Modals state
-  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
-  const [isPanicOpen, setIsPanicOpen] = useState(false);
   const [isCreateMandateOpen, setIsCreateMandateOpen] = useState(false);
   const [isCreateDelegationOpen, setIsCreateDelegationOpen] = useState(false);
   const [isRegisterAgentOpen, setIsRegisterAgentOpen] = useState(false);
-  const [proofTarget, setProofTarget] = useState<TransactionRecord | null>(null);
   const [editLimitTarget, setEditLimitTarget] = useState<MandateItem | null>(null);
+  const [selectedTx, setSelectedTx] = useState<TransactionRecord | null>(null);
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
+  const [payments, setPayments] = useState<MockPaymentItem[]>([]);
+  // Explicit domain setup: creating authority always needs user confirmation.
+  const [setupDomainId, setSetupDomainId] = useState<DomainId | null>(null);
+  const [mandateInitial, setMandateInitial] = useState<MandateInitialValues | null>(null);
 
-  // System State
-  const [panicSevered, setPanicSevered] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
@@ -47,21 +48,62 @@ export default function App() {
     }, 3500);
   };
 
-  // Data loading
   const refreshData = useCallback(async () => {
     try {
-      const [a, m, t, d] = await Promise.all([api.getAgents(), api.getMandates(), api.getTransactions(), api.getDelegations()]);
+      const [a, m, t, d, tk, ap, pay] = await Promise.all([
+        api.getAgents(),
+        api.getMandates(),
+        api.getTransactions(),
+        api.getDelegations(),
+        api.getTasks().catch(() => [] as TaskItem[]),
+        api.getApprovals().catch(() => [] as ApprovalItem[]),
+        api.getMockPayments().catch(() => [] as MockPaymentItem[]),
+      ]);
       setAgents(a);
       setMandates(m);
       setTransactions(t);
       setDelegations(d);
-      const allRevoked = a.length > 0 && a.every((ag) => ag.status === 'REVOKED');
-      setPanicSevered(allRevoked);
+      setTasks(tk);
+      setApprovals(ap);
+      setPayments(pay);
     } catch (e) {
       console.error('[App] refresh failed', e);
-      showToast('Failed to sync with Bound backend.');
+      showToast('Could not load data from the backend.');
     }
   }, []);
+
+  // One-time approval tokens live in localStorage (per browser session).
+  // The backend stores only hashes and returns each token exactly once.
+  const tokenStoreKey = 'bound.approval_tokens';
+  const readTokens = (): Record<string, string> => {
+    try {
+      return JSON.parse(localStorage.getItem(tokenStoreKey) || '{}') as Record<string, string>;
+    } catch {
+      return {};
+    }
+  };
+  const saveToken = (approvalId: string, token: string) => {
+    try {
+      const all = readTokens();
+      all[approvalId] = token;
+      localStorage.setItem(tokenStoreKey, JSON.stringify(all));
+    } catch {
+      /* storage unavailable — approval stays usable only in memory */
+    }
+  };
+  const takeToken = (approvalId: string): string | null => {
+    const token = readTokens()[approvalId] || null;
+    if (token) {
+      try {
+        const all = readTokens();
+        delete all[approvalId];
+        localStorage.setItem(tokenStoreKey, JSON.stringify(all));
+      } catch {
+        /* ignore */
+      }
+    }
+    return token;
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -77,120 +119,74 @@ export default function App() {
     };
   }, [refreshData]);
 
-  // Keyboard shortcut for Cmd+K / Ctrl+K
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setIsCommandPaletteOpen((prev) => !prev);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
-  // Panic Revoke All Handler — now hits backend PATCH for each
-  const handleConfirmPanic = async () => {
-    setPanicSevered(true);
-    const activeAgents = agents.filter((a) => a.status === 'ACTIVE');
-    const activeMandates = mandates.filter((m) => m.status === 'ACTIVE');
-    const activeDelegations = delegations.filter((d) => d.status === 'ACTIVE');
+  const handleCreateMandate = async (payload: { agent_id: string; purpose: string; max_amount: number; merchant_category: string; expires_at?: string | null }) => {
     try {
-      await Promise.all([
-        ...activeAgents.map((a) => api.updateAgentStatus(a.id, 'REVOKED').catch(() => null)),
-        ...activeMandates.map((m) => api.updateMandateStatus(m.id, 'REVOKED').catch(() => null)),
-        ...activeDelegations.map((d) => api.updateDelegationStatus(d.id, 'REVOKED').catch(() => null)),
-      ]);
+      await api.createMandate(payload);
+      showToast('Spending rule created.');
       await refreshData();
-      showToast('Panic protocol executed: All agent keys and delegations revoked across hardware enclaves.');
-    } catch {
-      showToast('Panic revoke partially failed — please refresh.');
-    }
-    setIsPanicOpen(false);
-    // Optimistic local update
-    setAgents((prev) => prev.map((a) => ({ ...a, status: 'REVOKED', heartbeat: 'Severed by Panic protocol' })));
-    setMandates((prev) => prev.map((m) => ({ ...m, status: 'REVOKED', safeBuffer: 'Mandate Inactive (Emergency Protocol)' })));
-    setDelegations((prev) => prev.map((d) => ({ ...d, status: 'REVOKED' } as DelegationItem)));
-  };
-
-  // Add Mandate — now creates via backend
-  const handleSaveMandate = async (newMandate: MandateItem) => {
-    const agent = agents.find((a) => a.name === newMandate.boundAgent);
-    if (!agent) {
-      showToast(`Cannot resolve agent ${newMandate.boundAgent}`);
-      return;
-    }
-    const mccRaw = newMandate.mccCode.replace(/^MCC\s*/i, '').trim() || 'Grocery';
-    let expiresIso: string | null = null;
-    if (newMandate.expiry && !newMandate.expiry.includes('No expiry')) {
-      const parsed = Date.parse(newMandate.expiry.replace('Expires ', ''));
-      if (!isNaN(parsed)) expiresIso = new Date(parsed).toISOString();
-    }
-    try {
-      const created = await api.createMandate({
-        agent_id: agent.id,
-        purpose: newMandate.name,
-        max_amount: newMandate.cap,
-        merchant_category: mccRaw,
-        expires_at: expiresIso,
-      });
-      setMandates((prev) => [created, ...prev]);
-      showToast(`Mandate ${created.code} created & signed with Root Vault KMS.`);
-      await refreshData();
-    } catch (e: any) {
-      showToast(`Failed to create mandate: ${e.message || e}`);
-    }
-  };
-
-  const handleCreateMandateApi = async (payload: { agent_id: string; purpose: string; max_amount: number; merchant_category: string; expires_at?: string | null }) => {
-    try {
-      const created = await api.createMandate(payload);
-      setMandates((prev) => [created, ...prev]);
-      showToast(`Mandate ${created.code} created & signed with Root Vault KMS.`);
-      await refreshData();
-    } catch (e: any) {
-      showToast(`Failed to create mandate: ${e.message || e}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not create rule: ${e.message}` : 'Could not create rule.');
       throw e;
     }
   };
 
-  // Add Agent — now creates via backend
-  const handleRegisterAgent = async (newAgent: AgentNode) => {
-    const name = newAgent.name;
-    const cap = newAgent.authorizedAmount || 5000;
-    const mccList = (newAgent.mccAllowed || []).join(', ');
-    const description = `${newAgent.purpose || ''} Cap ₹${cap}, MCCs: ${mccList}`.trim();
+  const handleRegisterAgent = async (payload: { name: string; description?: string }) => {
     try {
-      const created = await api.createAgent({ name, description, capAmount: cap, mccList });
-      setAgents((prev) => [created, ...prev]);
-      showToast(`Agent ${created.name} provisioned in Bound Nitro Enclave.`);
+      await api.createAgent(payload);
+      showToast('Agent created.');
       await refreshData();
-    } catch (e: any) {
-      showToast(`Failed to register agent: ${e.message || e}`);
-    }
-  };
-
-  const handleRegisterAgentApi = async (payload: { name: string; description?: string; capAmount?: number; mccList?: string }) => {
-    try {
-      const created = await api.createAgent(payload);
-      setAgents((prev) => [created, ...prev]);
-      showToast(`Agent ${created.name} provisioned in Bound Nitro Enclave.`);
-      await refreshData();
-    } catch (e: any) {
-      showToast(`Failed to register agent: ${e.message || e}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not create agent: ${e.message}` : 'Could not create agent.');
       throw e;
     }
   };
 
-  // Delegation handlers
   const handleCreateDelegation = async (payload: { parent_agent_id: string; child_agent_id: string; parent_mandate_id: string; delegated_amount_limit: number; purpose: string; merchant_category: string; expires_at?: string | null }) => {
     try {
-      const created = await api.createDelegation(payload);
-      setDelegations((prev) => [created, ...prev]);
-      showToast(`Delegation ${created.id} created: ${created.parentAgentName} → ${created.childAgentName} ₹${created.delegatedLimit.toLocaleString()}`);
+      await api.createDelegation(payload);
+      showToast('Delegation created.');
       await refreshData();
-    } catch (e: any) {
-      showToast(`Failed to create delegation: ${e.message || e}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not create delegation: ${e.message}` : 'Could not create delegation.');
+      throw e;
+    }
+  };
+
+  const handleSaveLimit = async (id: string, newCap: number) => {
+    try {
+      await api.updateMandateCap(id, newCap);
+      await refreshData();
+      showToast('Limit updated.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not update limit: ${e.message}` : 'Could not update limit.');
+      throw e;
+    }
+  };
+
+  const handleToggleMandate = async (id: string) => {
+    const target = mandates.find((m) => m.id === id);
+    if (!target) return;
+    const nextStatus = target.status === 'ACTIVE' ? 'REVOKED' : 'ACTIVE';
+    try {
+      await api.updateMandateStatus(id, nextStatus);
+      await refreshData();
+      showToast(nextStatus === 'REVOKED' ? 'Rule revoked.' : 'Rule re-activated.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not update rule: ${e.message}` : 'Could not update rule.');
+      throw e;
+    }
+  };
+
+  const handleRevokeAgent = async (agentId: string) => {
+    const target = agents.find((a) => a.id === agentId);
+    if (!target) return;
+    const nextStatus = target.status === 'REVOKED' ? 'ACTIVE' : 'REVOKED';
+    try {
+      await api.updateAgentStatus(agentId, nextStatus);
+      await refreshData();
+      showToast(nextStatus === 'REVOKED' ? `${target.name} revoked.` : `${target.name} restored.`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not update agent: ${e.message}` : 'Could not update agent.');
       throw e;
     }
   };
@@ -199,79 +195,129 @@ export default function App() {
     try {
       await api.updateDelegationStatus(id, 'REVOKED');
       await refreshData();
-      showToast('Delegation revoked. Child can no longer act under parent authority.');
-    } catch (e: any) {
-      showToast(`Failed to revoke delegation: ${e.message || e}`);
+      showToast('Delegation revoked.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not revoke delegation: ${e.message}` : 'Could not revoke delegation.');
+      throw e;
     }
   };
 
-  // Edit Mandate Limit — PATCH backend
-  const handleSaveLimit = async (id: string, newCap: number) => {
+  // Home task → real backend task. The decision, risk, approval token and
+  // provenance all come from POST /tasks/authorize; the UI only displays.
+  const handleCheckTask = async (input: TaskCheckInput) => {
+    const res = await api.authorizeTask({
+      domain_agent_id: input.draft.agentId || '',
+      purpose: input.purpose,
+      requested_amount: input.budget,
+      category: mandates.find((m) => m.id === input.draft.mandateId)?.merchant_category || 'General',
+      merchant: input.merchant,
+    });
+    if (res.approval && res.approval_token) {
+      saveToken(res.approval.id, res.approval_token);
+    }
+    await refreshData();
+    showToast(res.task.status === 'APPROVED' ? 'Approved.' : 'Needs review — see why below.');
+    return res;
+  };
+
+  const handleApprove = async (approval: ApprovalItem) => {
+    const token = readTokens()[approval.id] || null;
+    if (!token) {
+      showToast('Approval token unavailable — it was issued in another session.');
+      throw new Error('Approval token unavailable — it was issued in another session.');
+    }
     try {
-      await api.updateMandateCap(id, newCap);
+      await api.resolveApproval(approval.id, token, 'approve');
+      takeToken(approval.id);
       await refreshData();
-      showToast(`Mandate limit updated to ₹${newCap.toLocaleString()}.`);
-    } catch (e: any) {
-      showToast(`Failed to update limit: ${e.message || e}`);
+      showToast('Approved once — your rule is unchanged.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not approve: ${e.message}` : 'Could not approve.');
+      throw e;
     }
   };
 
-  // Toggle Mandate Revocation — PATCH
-  const handleToggleRevokeMandate = async (id: string) => {
-    const target = mandates.find((m) => m.id === id);
-    if (!target) return;
-    const nextStatus = target.status === 'ACTIVE' ? 'REVOKED' : 'ACTIVE';
+  const handleDeny = async (approval: ApprovalItem) => {
+    const token = readTokens()[approval.id] || null;
+    if (!token) {
+      showToast('Approval token unavailable — it was issued in another session.');
+      throw new Error('Approval token unavailable — it was issued in another session.');
+    }
     try {
-      await api.updateMandateStatus(id, nextStatus as any);
+      await api.resolveApproval(approval.id, token, 'deny');
+      takeToken(approval.id);
       await refreshData();
-      showToast(nextStatus === 'REVOKED' ? 'Mandate revoked.' : 'Mandate re-activated.');
-    } catch (e: any) {
-      showToast(`Failed to toggle mandate: ${e.message || e}`);
+      showToast('Denied.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not deny: ${e.message}` : 'Could not deny.');
+      throw e;
     }
   };
 
-  // Revoke single agent key — PATCH
-  const handleRevokeAgent = async (agentId: string) => {
-    const target = agents.find((a) => a.id === agentId);
-    if (!target) return;
-    const nextStatus = target.status === 'REVOKED' ? 'ACTIVE' : 'REVOKED';
+  const handleCancelTask = async (task: TaskItem) => {
     try {
-      await api.updateAgentStatus(agentId, nextStatus);
+      await api.cancelTask(task.id);
       await refreshData();
-      showToast(nextStatus === 'REVOKED' ? `Agent ${target.name} revoked.` : `Agent ${target.name} restored.`);
-    } catch (e: any) {
-      showToast(`Failed to update agent: ${e.message || e}`);
+      showToast('Task cancelled.');
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not cancel: ${e.message}` : 'Could not cancel.');
+      throw e;
     }
   };
 
-  // Rotate single agent signature — local only
-  const handleRotateSignature = (agentId: string) => {
-    const newHash = `sha256:${Math.random().toString(36).substring(2, 7)}…${Math.random().toString(36).substring(2, 5)}`;
-    setAgents((prev) =>
-      prev.map((a) => {
-        if (a.id === agentId) {
-          return { ...a, hash: newHash, heartbeat: 'Rotated just now' };
-        }
-        return a;
-      })
-    );
-    showToast(`Cryptographic keypair rotated. Enclave PCR0 attestation re-signed.`);
+  // Demo payment: create + execute back-to-back. The backend gates both
+  // steps on task APPROVED + fresh + agent ACTIVE; the UI only displays.
+  const handlePayTask = async (task: TaskItem, method: string, note: string) => {
+    try {
+      const created = await api.createMockPayment(task.id, method, note);
+      const result = await api.executeMockPayment(created.id);
+      await refreshData();
+      showToast(result.status === 'SUCCEEDED' ? 'Payment successful (demo).' : 'Payment failed (demo).');
+      return result;
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Payment failed: ${e.message}` : 'Payment failed.');
+      throw e;
+    }
   };
 
-  const handleResolveViolation = async (action: 'override' | 'revoke' | 'reject') => {
-    if (action === 'revoke') {
-      const toRevoke = agents.find((a) => a.id === 'shopping-agent' || a.name.toLowerCase().includes('payment')) || agents[0];
-      if (toRevoke) {
-        try {
-          await api.updateAgentStatus(toRevoke.id, 'REVOKED');
-          await refreshData();
-        } catch {}
-      }
-      showToast('Payment Agent keypair severed. Downstream token invalidation complete.');
-    } else if (action === 'override') {
-      showToast('One-time WebAuthn biometric override registered.');
-    } else {
-      showToast('Violation event committed to tamper-proof Merkle audit tree.');
+  const handleRetryPayment = async (payment: MockPaymentItem) => {
+    try {
+      const result = await api.executeMockPayment(payment.id);
+      await refreshData();
+      showToast(result.status === 'SUCCEEDED' ? 'Payment successful (demo).' : 'Payment failed (demo).');
+      return result;
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Retry failed: ${e.message}` : 'Retry failed.');
+      throw e;
+    }
+  };
+
+  // Step 1 of explicit domain setup: create the agent (confirmed in dialog,
+  // including its backend domain and the category the rule will cover).
+  // Step 2 opens the normal rule form prefilled — the rule is a separate
+  // explicit confirmation, so no authority is ever granted silently.
+  const handleConfirmSetupDomain = async (values: SetupDomainValues) => {
+    if (!setupDomainId) return;
+    const domain = DOMAINS.find((d) => d.id === setupDomainId);
+    try {
+      const created = await api.createAgent({
+        name: values.agentName,
+        description: `${values.purpose} — managed via Bound`,
+        domain: setupDomainId.toUpperCase(),
+      });
+      await refreshData();
+      showToast(`Agent “${created.name}” created. Now confirm its spending rule.`);
+      setSetupDomainId(null);
+      setMandateInitial({
+        agentId: created.id,
+        purpose: values.purpose,
+        cap: values.cap,
+        category: domain && domain.categories.includes(values.category) ? values.category : undefined,
+      });
+      setIsCreateMandateOpen(true);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Could not create agent: ${e.message}` : 'Could not create agent.');
+      throw e;
     }
   };
 
@@ -279,118 +325,146 @@ export default function App() {
     try {
       const res = await api.authorizePayment(payload);
       await refreshData();
-      // Show chain in toast if present
-      const chainHint = res.chain ? ` Chain: ${res.chain.map((s) => s.step).join(' → ')}` : '';
-      showToast(`Authorization ${res.decision}: ${res.reason} (TX ${res.transaction_id})${chainHint}`);
+      showToast(res.decision === 'ALLOW' ? `Approved — ${res.transaction_id}` : `Needs review — ${res.transaction_id}`);
       return res;
-    } catch (e: any) {
-      showToast(`Authorization failed: ${e.message || e}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Payment check failed: ${e.message}` : 'Payment check failed.');
       throw e;
     }
   };
 
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[#f8f9ff] text-[#0b1c30] gap-3">
-        <div className="w-8 h-8 border-4 border-[#c6c6cd]/30 border-t-[#0051d5] rounded-full animate-spin" />
-        <p className="font-mono text-[12px] text-[#76777d]">Syncing with Bound enclave…</p>
-        <p className="font-mono text-[11px] text-[#45464d]">Connecting to {BASE}…</p>
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#f7f8fb] text-[#0b1c30] gap-3">
+        <div className="w-7 h-7 border-[3px] border-[#e2e3e8] border-t-[#0b1c30] rounded-full animate-spin" />
+        <p className="text-[13px] text-[#5a5c63]">Loading Bound…</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#f8f9ff] text-[#0b1c30]">
+    <div className="min-h-screen flex flex-col bg-[#f7f8fb] text-[#0b1c30]">
       {toastMessage && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-[#0b1c30] text-[#ffffff] shadow-2xl border border-[#ffffff]/20 font-mono text-[12px] animate-in slide-in-from-bottom-3 max-w-[90vw]">
-          <span className="material-symbols-outlined text-[#009668] text-[18px]">check_circle</span>
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2 px-4 py-3 rounded-xl bg-[#0b1c30] text-white shadow-xl text-[13px] max-w-[90vw]">
           <span>{toastMessage}</span>
         </div>
       )}
 
       {backendLive === false && (
-        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-40 px-3 py-1 rounded-full bg-[#ffdad6] border border-[#ba1a1a]/30 text-[#93000a] font-mono text-[11px] flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-[#ba1a1a] animate-pulse" />
-          Backend offline — showing cached demo data
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-40 px-3 py-1.5 rounded-full bg-[#fdecea] border border-[#e8c4c0] text-[#93000a] text-[12px]">
+          Backend offline — data may be stale
         </div>
       )}
 
-      <Header activeTab={activeTab} onTabChange={setActiveTab} onOpenCommandPalette={() => setIsCommandPaletteOpen(true)} panicSevered={panicSevered} />
+      <Header activeTab={activeTab} onTabChange={setActiveTab} backendLive={backendLive} />
 
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-24 pb-12">
-        <div className="mb-6 flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-[12px] text-[#76777d]">
-            <button onClick={() => setActiveTab('overview')} className="hover:text-[#0b1c30] cursor-pointer">
-              Vault #1
-            </button>
-            <span>/</span>
-            <span className="text-[#0b1c30] font-medium capitalize">{activeTab === 'violation' ? 'Security Intercept' : activeTab}</span>
-            {backendLive && <span className="ml-2 hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#eff4ff] border border-[#c6c6cd]/30 text-[#009668] font-mono text-[10px]">● Live · {BASE}</span>}
-          </div>
-
-          {activeTab !== 'violation' && (
-            <button
-              onClick={() => setActiveTab('violation')}
-              className="text-[11px] font-mono px-2 py-1 rounded bg-[#ffdad6] text-[#93000a] hover:bg-[#ffb4ab] transition-colors cursor-pointer flex items-center gap-1 border border-[#ba1a1a]/30"
-            >
-              <span className="material-symbols-outlined text-[14px]">warning</span>
-              <span>Inspect Intercept #INC-901844</span>
-            </button>
-          )}
-        </div>
-
-        {activeTab === 'overview' && (
-          <OverviewView
+      <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-20 pb-12">
+        {activeTab === 'home' && (
+          <HomeView
             agents={agents}
             mandates={mandates}
             transactions={transactions}
-            onOpenProof={(tx) => setProofTarget(tx)}
-            onOpenPanic={() => setIsPanicOpen(true)}
-            onOpenCreateMandate={() => setIsCreateMandateOpen(true)}
-            onNavigateTab={setActiveTab}
-            panicSevered={panicSevered}
+            tasks={tasks}
+            approvals={approvals}
+            payments={payments}
+            backendLive={backendLive}
+            onNavigate={setActiveTab}
+            onSelectTransaction={setSelectedTx}
+            onCheckTask={handleCheckTask}
+            onApprove={handleApprove}
+            onDeny={handleDeny}
+            onCancelTask={handleCancelTask}
+            onPayTask={handlePayTask}
+            onRetryPayment={handleRetryPayment}
+            onRevokeAgent={handleRevokeAgent}
+            onSetupDomain={setSetupDomainId}
+            notify={showToast}
           />
         )}
 
-        {activeTab === 'agents' && <AgentsView agents={agents} onOpenRegisterModal={() => setIsRegisterAgentOpen(true)} onRevokeAgent={handleRevokeAgent} onRotateSignature={handleRotateSignature} />}
-
-        {activeTab === 'mandates' && (
-          <MandatesView
+        {activeTab === 'agents' && (
+          <AgentsView
+            agents={agents}
             mandates={mandates}
-            onOpenCreateMandate={() => setIsCreateMandateOpen(true)}
-            onEditLimit={(m) => setEditLimitTarget(m)}
-            onToggleRevoke={handleToggleRevokeMandate}
+            delegations={delegations}
+            transactions={transactions}
+            onOpenRegister={() => setIsRegisterAgentOpen(true)}
+            onRevokeAgent={handleRevokeAgent}
           />
         )}
 
-        {activeTab === 'delegations' && (
-          <DelegationsView delegations={delegations} agents={agents} mandates={mandates} onOpenCreate={() => setIsCreateDelegationOpen(true)} onRevoke={handleRevokeDelegation} />
+        {activeTab === 'rules' && (
+          <RulesView
+            agents={agents}
+            mandates={mandates}
+            delegations={delegations}
+            transactions={transactions}
+            onOpenCreateMandate={() => {
+              setMandateInitial(null);
+              setIsCreateMandateOpen(true);
+            }}
+            onOpenCreateDelegation={() => setIsCreateDelegationOpen(true)}
+            onEditLimit={(m) => setEditLimitTarget(m)}
+            onToggleMandate={handleToggleMandate}
+            onRevokeDelegation={handleRevokeDelegation}
+            onAddRuleForAgent={(agentId) => {
+              setMandateInitial({ agentId });
+              setIsCreateMandateOpen(true);
+            }}
+          />
         )}
 
-        {activeTab === 'transactions' && <PaymentVerificationView agents={agents} transactions={transactions} onAuthorize={handleAuthorize} onRefresh={refreshData} />}
+        {activeTab === 'activity' && (
+          <ActivityView
+            agents={agents}
+            transactions={transactions}
+            tasks={tasks}
+            approvals={approvals}
+            payments={payments}
+            selected={selectedTx}
+            onSelect={setSelectedTx}
+            onAuthorize={handleAuthorize}
+            onRefresh={refreshData}
+          />
+        )}
 
-        {activeTab === 'security' && <SecurityAuditView />}
+        {activeTab === 'audit' && <AuditView transactions={transactions} />}
 
-        {activeTab === 'violation' && <SecurityViolationView onResolveViolation={handleResolveViolation} onNavigateTab={setActiveTab} />}
+        {activeTab === 'preferences' && <PreferencesView transactions={transactions} />}
       </main>
 
       <Footer />
 
-      <CommandPaletteModal isOpen={isCommandPaletteOpen} onClose={() => setIsCommandPaletteOpen(false)} agents={agents} mandates={mandates} transactions={transactions} onSelectTab={setActiveTab} onOpenProof={(tx) => setProofTarget(tx)} />
+      {/* Shared transaction detail for Home (Activity has its own drawer) */}
+      {activeTab === 'home' && selectedTx && (
+        <TransactionDetailModal tx={selectedTx} onClose={() => setSelectedTx(null)} />
+      )}
 
-      <PanicModal isOpen={isPanicOpen} onClose={() => setIsPanicOpen(false)} onConfirm={handleConfirmPanic} />
+      {setupDomainId && (
+        <SetupDomainDialog
+          domain={DOMAINS.find((d) => d.id === setupDomainId) || DOMAINS[0]}
+          existingNames={agents.map((a) => a.name)}
+          onCancel={() => setSetupDomainId(null)}
+          onConfirm={handleConfirmSetupDomain}
+        />
+      )}
 
-      <CreateMandateModal isOpen={isCreateMandateOpen} onClose={() => setIsCreateMandateOpen(false)} agents={agents} onSaveMandate={handleSaveMandate} onCreateMandateApi={handleCreateMandateApi} />
+      <CreateMandateModal
+        isOpen={isCreateMandateOpen}
+        onClose={() => {
+          setIsCreateMandateOpen(false);
+          setMandateInitial(null);
+        }}
+        agents={agents}
+        onCreate={handleCreateMandate}
+        initial={mandateInitial}
+      />
 
-      <RegisterAgentModal isOpen={isRegisterAgentOpen} onClose={() => setIsRegisterAgentOpen(false)} onRegisterAgent={handleRegisterAgent} onRegisterAgentApi={handleRegisterAgentApi} />
+      <RegisterAgentModal isOpen={isRegisterAgentOpen} onClose={() => setIsRegisterAgentOpen(false)} onCreate={handleRegisterAgent} />
 
       <CreateDelegationModal isOpen={isCreateDelegationOpen} onClose={() => setIsCreateDelegationOpen(false)} agents={agents} mandates={mandates} onCreate={handleCreateDelegation} />
 
-      <EditLimitModal isOpen={!!editLimitTarget} onClose={() => setEditLimitTarget(null)} mandate={editLimitTarget} onSaveLimit={handleSaveLimit} />
-
-      <ProofModal isOpen={!!proofTarget} onClose={() => setProofTarget(null)} txId={proofTarget?.id} agent={proofTarget?.agent} merchant={proofTarget?.merchant} amount={proofTarget?.amount} status={proofTarget?.decision === 'ALLOW' ? 'ALLOWED' : 'VERIFIED'} />
+      <EditLimitModal isOpen={!!editLimitTarget} onClose={() => setEditLimitTarget(null)} mandate={editLimitTarget} onSave={handleSaveLimit} />
     </div>
   );
 }
-
-const BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/+$/, '') || 'http://localhost:4000';

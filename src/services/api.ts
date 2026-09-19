@@ -1,7 +1,5 @@
 /**
- * Bound — Live API layer (Phase 3 — delegation)
- *
- * Real FastAPI calls with delegation chain support.
+ * Bound — Live API layer.
  *
  * Backend contract (SQLite):
  *  agents:       id, name, description, status, created_at
@@ -12,25 +10,13 @@
  * VITE_API_URL controls the base. Falls back to http://localhost:4000 for local dev.
  */
 
-import type { AgentNode, MandateItem, TransactionRecord, AuditStep, DelegationItem, DelegationChain, ProvenanceEvent, ProvenanceVerifyResult } from '../types';
-import { INITIAL_AGENTS, INITIAL_MANDATES, INITIAL_TRANSACTIONS, PROVENANCE_STEPS } from '../data/mockData';
+import type { AgentNode, MandateItem, TransactionRecord, DelegationItem, DelegationChain, ProvenanceEvent, ProvenanceVerifyResult, TaskItem, ApprovalItem, MockPaymentItem } from '../types';
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 const RAW_URL = (import.meta.env.VITE_API_URL as string | undefined) || '';
-// Trim trailing slashes; allow empty → fallback to localhost:4000
 export const API_URL = RAW_URL.replace(/\/+$/, '') || 'http://localhost:4000';
-
-// Normalise base: if user set http://localhost:4000/api we keep it, if http://localhost:4000 we keep it.
-// Caller always appends "/agents" etc so both `/agents` and `/api/agents` are covered because backend mounts both.
 const BASE = API_URL;
 
-// ---------------------------------------------------------------------------
-// Low-level fetch helpers
-// ---------------------------------------------------------------------------
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  // Allow path like "/agents" — prepend BASE
   const url = `${BASE}${path.startsWith('/') ? path : `/${path}`}`;
   const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
@@ -40,7 +26,6 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text().catch(() => '');
     throw new Error(`API ${res.status} ${res.statusText} at ${url}: ${text}`);
   }
-  // 204 has no body
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -52,7 +37,9 @@ interface BackendAgent {
   id: string;
   name: string;
   description?: string | null;
-  status: string; // ACTIVE | REVOKED
+  status: string;
+  domain?: string | null;
+  is_task_agent?: boolean | null;
   created_at: string;
 }
 interface BackendMandate {
@@ -63,7 +50,7 @@ interface BackendMandate {
   currency: string;
   merchant_category: string;
   expires_at?: string | null;
-  status: string; // ACTIVE | REVOKED | EXPIRED
+  status: string;
   created_at: string;
 }
 interface BackendTransaction {
@@ -76,13 +63,13 @@ interface BackendTransaction {
   merchant: string;
   merchant_category: string;
   purpose: string;
-  decision: string; // ALLOW | VERIFY (final)
+  decision: string;
   reason: string;
   created_at: string;
   authorization_status?: string | null;
   risk_score?: number | null;
   risk_level?: string | null;
-  risk_factors?: any | null;
+  risk_factors?: unknown;
 }
 interface BackendDelegation {
   id: string;
@@ -92,242 +79,129 @@ interface BackendDelegation {
   delegated_amount_limit: number;
   purpose: string;
   merchant_category: string;
-  status: string; // ACTIVE | REVOKED | EXPIRED
+  status: string;
   created_at: string;
   expires_at?: string | null;
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — formatting & enrichment
+// Helpers — formatting only (no invented data)
 // ---------------------------------------------------------------------------
 function formatDateLong(iso?: string | null): string {
   if (!iso) return 'No expiry';
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return 'No expiry';
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
 }
 function formatExpiry(iso?: string | null): string {
   if (!iso) return 'No expiry';
-  const d = new Date(iso);
-  return `Expires ${formatDateLong(iso)}`;
+  return `Until ${formatDateLong(iso)}`;
 }
 function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.max(1, Math.floor(diff / 60000));
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return '';
+  const diff = Date.now() - t;
+  const mins = Math.max(0, Math.floor(diff / 60000));
+  if (mins < 1) return 'Just now';
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   const days = Math.floor(hrs / 24);
   return `${days}d ago`;
 }
-function formatTime(iso: string): string {
-  const d = new Date(iso);
-  const now = new Date();
-  const isToday = d.toDateString() === now.toDateString();
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  const isYesterday = d.toDateString() === yesterday.toDateString();
-  if (isYesterday) return 'Yesterday';
-  if (isToday) return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-}
 function formatTimestamp(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'medium', timeZone: 'Asia/Kolkata' }) + ' IST';
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
-// Known rich overrides for demo continuity — mirrors mockData
-const KNOWN_AGENT_ENRICH: Record<string, Partial<AgentNode>> = {
-  'shopping-agent': {
-    runtimeId: 'agt_01h8x9p3km',
-    cap: '₹2,000',
-    scopeSummary: 'Grocery MCC limits',
-    heartbeatCode: 'tx_ack',
-    authorizedAmount: 2000,
-    requestedAmount: 800,
-    remainingHeadroom: 1200,
-    policy: 'HARD_STOP_AT_100%',
-    hash: 'sha256:7e01b…89c',
-    mccAllowed: ['MCC 5411 (Grocery Stores)', 'MCC 5499 (Misc Food Markets)'],
-    expiryDate: '20 Sep 2026',
-    velocityLimit: 'Max 3 Tx / 24h',
-    canSubDelegate: true,
-    delegationTarget: 'Payment Agent',
-    purpose: 'Groceries (Food supplies, supermarkets, household essentials only)',
-    creator: 'Root Vault',
-    creatorSub: '#492 (You)',
-  },
-  'travel-agent': {
-    runtimeId: 'agt_74m9k2x1po',
-    cap: '₹8,000',
-    scopeSummary: 'Airlines / Hotel',
-    heartbeatCode: 'sig_kill',
-    authorizedAmount: 8000,
-    requestedAmount: 7450,
-    remainingHeadroom: 550,
-    policy: 'HARD_STOP_AT_100%',
-    hash: 'sha256:3a42d…109',
-    mccAllowed: ['MCC 3000-3350 (Commercial Airlines)', 'MCC 7011 (Hotels)'],
-    expiryDate: '15 Oct 2026',
-    velocityLimit: 'Max 1 Tx / 48h',
-    canSubDelegate: false,
-    purpose: 'Corporate travel booking with automated flight & accommodation settlement',
-    creator: 'Root Vault',
-    creatorSub: '#492 (You)',
-  },
-};
-
 function mapBackendAgent(b: BackendAgent): AgentNode {
-  const known = KNOWN_AGENT_ENRICH[b.id];
-  // Try to parse cap/MCC from description if present: e.g. "Cap ₹5000, MCCs: 5411, 5812"
-  let capFromDesc: number | null = null;
-  let mccFromDesc: string[] | null = null;
-  if (b.description) {
-    const capMatch = b.description.match(/(\d[\d,]*)/);
-    if (capMatch) {
-      const n = parseInt(capMatch[1].replace(/,/g, ''), 10);
-      if (!isNaN(n) && n > 0 && n < 10000000) capFromDesc = n;
-    }
-    const mccMatch = b.description.match(/MCCs?:?\s*([0-9,\s]+)/i);
-    if (mccMatch) {
-      mccFromDesc = mccMatch[1]
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .map((c) => `MCC ${c}`);
-    }
-  }
-
-  const capNum = known?.authorizedAmount ?? capFromDesc ?? 5000;
-  const mccAllowed = known?.mccAllowed ?? mccFromDesc ?? ['MCC 5411 (Grocery Stores)'];
-
+  const d = (b.domain || 'OTHER').toUpperCase();
   return {
     id: b.id,
     name: b.name,
-    runtimeId: known?.runtimeId ?? `agt_${b.id.slice(0, 8)}`,
-    status: (b.status === 'REVOKED' ? 'REVOKED' : b.status === 'IDLE' ? 'IDLE' : 'ACTIVE') as AgentNode['status'],
-    creator: known?.creator ?? 'Root Vault',
-    creatorSub: known?.creatorSub ?? '#492 (You)',
-    cap: known?.cap ?? `₹${capNum.toLocaleString()}`,
-    scopeSummary: known?.scopeSummary ?? (b.description?.slice(0, 40) || `${mccAllowed[0]}`),
-    heartbeat: b.status === 'REVOKED' ? 'Revoked just now' : known?.heartbeat ?? timeAgo(b.created_at),
-    heartbeatCode: known?.heartbeatCode ?? (b.status === 'REVOKED' ? 'sig_kill' : 'tx_ack'),
-    authorizedAmount: known?.authorizedAmount ?? capNum,
-    requestedAmount: known?.requestedAmount ?? 0,
-    remainingHeadroom: known?.remainingHeadroom ?? capNum,
-    policy: known?.policy ?? 'HARD_STOP_AT_100%',
-    hash: known?.hash ?? `sha256:${b.id.slice(0, 5)}…${b.id.slice(-3)}`,
-    mccAllowed,
-    expiryDate: known?.expiryDate ?? '31 Dec 2026',
-    velocityLimit: known?.velocityLimit ?? 'Max 5 Tx / 24h',
-    canSubDelegate: known?.canSubDelegate ?? true,
-    delegationTarget: known?.delegationTarget,
-    purpose: known?.purpose ?? b.description ?? `${b.name} automated spending envelope`,
+    description: b.description || '',
+    status: (b.status === 'REVOKED' ? 'REVOKED' : 'ACTIVE') as AgentNode['status'],
+    domain: (d === 'FOOD' || d === 'TRAVEL' || d === 'SHOPPING' ? d : 'OTHER') as AgentNode['domain'],
+    is_task_agent: b.is_task_agent === true,
+    created_at: b.created_at,
   };
 }
 
-// Mandate mapping — needs agent name lookup
 function mapBackendMandate(b: BackendMandate, agentMap: Map<string, string>): MandateItem {
-  // Known overrides for continuity
-  if (b.id === 'mnd-4091') {
-    return {
-      id: b.id,
-      code: 'MND-4091',
-      name: 'Groceries',
-      expiry: formatExpiry(b.expires_at),
-      spent: 1460,
-      cap: b.max_amount,
-      safeBuffer: `₹${(b.max_amount - 1460).toLocaleString()} Safe Buffer Remaining`,
-      boundAgent: agentMap.get(b.agent_id) || b.agent_id,
-      subDelegationNote: 'Sub-delegates to Payment Agent',
-      agentHash: 'sha256:7e01b…89c',
-      permittedScopeTitle: 'Supermarkets, Food & Daily Provisions',
-      mccCode: `MCC ${b.merchant_category}`,
-      mccDetail: 'Strict Isolation',
-      status: (b.status === 'ACTIVE' ? 'ACTIVE' : 'REVOKED') as MandateItem['status'],
-    };
-  }
-  if (b.id === 'mnd-1108') {
-    return {
-      id: b.id,
-      code: 'MND-1108',
-      name: 'Flight Booking',
-      expiry: formatExpiry(b.expires_at),
-      spent: 7450,
-      cap: b.max_amount,
-      safeBuffer: '₹550 Limit Threshold Imminent',
-      isThresholdImminent: true,
-      boundAgent: agentMap.get(b.agent_id) || b.agent_id,
-      subDelegationNote: 'Direct execution (Solo Agent)',
-      agentHash: 'sha256:3a42d…109',
-      permittedScopeTitle: 'Commercial Airlines',
-      mccCode: `MCC ${b.merchant_category}`,
-      mccDetail: 'OTA Enforced',
-      status: (b.status === 'ACTIVE' ? 'ACTIVE' : 'REVOKED') as MandateItem['status'],
-    };
-  }
-
-  const isRevoked = b.status !== 'ACTIVE';
-  const spent = 0; // Phase 2: no spend aggregation yet
-  const remaining = b.max_amount - spent;
+  const agentName = agentMap.get(b.agent_id) || b.agent_id;
+  const status = (b.status === 'REVOKED' ? 'REVOKED' : b.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE') as MandateItem['status'];
   return {
     id: b.id,
     code: b.id.toUpperCase(),
-    name: b.purpose,
-    expiry: formatExpiry(b.expires_at),
-    spent,
+    agent_id: b.agent_id,
+    agentName,
+    purpose: b.purpose,
+    max_amount: b.max_amount,
     cap: b.max_amount,
-    safeBuffer: isRevoked ? 'Lifecycle Terminated' : `₹${remaining.toLocaleString()} Safe Buffer Remaining`,
-    isThresholdImminent: !isRevoked && remaining < 600,
-    boundAgent: agentMap.get(b.agent_id) || b.agent_id,
-    subDelegationNote: 'Direct execution',
-    agentHash: `sha256:${b.id.slice(0, 5)}…${b.id.slice(-3)}`,
-    permittedScopeTitle: b.purpose,
-    mccCode: `MCC ${b.merchant_category}`,
-    mccDetail: isRevoked ? 'Revoked' : 'Strict Isolation',
-    status: (isRevoked ? 'REVOKED' : 'ACTIVE') as MandateItem['status'],
+    merchant_category: b.merchant_category,
+    status,
+    created_at: b.created_at,
+    expires_at: b.expires_at || null,
+    expiresLabel: formatExpiry(b.expires_at),
+    name: b.purpose,
+    boundAgent: agentName,
+    expiry: formatExpiry(b.expires_at),
   };
 }
 
-function mapBackendTransaction(b: BackendTransaction, agentMap: Map<string, string>): TransactionRecord {
-  // Keep original mock IDs stable for UI deep-links (proof modal etc.)
-  // New TX-* IDs are used for Phase-2 created transactions
-  const agentName = agentMap.get(b.agent_id) || b.agent_id;
-  const decision = (b.decision === 'ALLOW' ? 'ALLOW' : b.decision === 'BLOCK' ? 'BLOCK' : 'VERIFY') as TransactionRecord['decision'];
-  const isAllow = decision === 'ALLOW';
-  // Derive action & amount
-  const amountStr = `₹${Number(b.amount).toLocaleString()}`;
-  // Agent color mapping — deterministic hash
-  const colors = ['bg-on-tertiary-container', 'bg-secondary', 'bg-outline-variant', 'bg-primary', 'bg-tertiary-container'];
-  const colorIdx = b.agent_id.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % colors.length;
-  const agentColor = colors[colorIdx];
-
-  // Parse risk_factors if stored as JSON string
-  let risk_factors: any = (b as any).risk_factors;
-  if (typeof risk_factors === 'string') {
+function parseRiskFactors(raw: unknown): TransactionRecord['risk_factors'] {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((f) => f && typeof f === 'object')
+      .map((f) => {
+        const o = f as Record<string, unknown>;
+        const sev = String(o.severity || 'MEDIUM').toUpperCase();
+        return {
+          type: String(o.type || 'RISK'),
+          severity: (sev === 'HIGH' ? 'HIGH' : sev === 'LOW' ? 'LOW' : 'MEDIUM') as 'LOW' | 'MEDIUM' | 'HIGH',
+          message: String(o.message || ''),
+        };
+      });
+  }
+  if (typeof raw === 'string') {
     try {
-      risk_factors = JSON.parse(risk_factors);
+      return parseRiskFactors(JSON.parse(raw));
     } catch {
-      risk_factors = null;
+      return null;
     }
   }
+  return null;
+}
+
+function mapBackendTransaction(b: BackendTransaction, agentMap: Map<string, string>): TransactionRecord {
+  const agentName = agentMap.get(b.agent_id) || b.agent_id;
+  const decision = (b.decision === 'ALLOW' ? 'ALLOW' : 'VERIFY') as TransactionRecord['decision'];
+  const amountStr = `₹${Number(b.amount).toLocaleString()}`;
   return {
     id: b.id,
-    time: timeAgo(b.created_at) === '1m ago' ? 'Just now' : formatTime(b.created_at),
+    agent_id: b.agent_id,
     agent: agentName,
-    agentColor,
-    action: `${b.purpose} (${b.merchant})`,
     amount: amountStr,
     rawAmount: Number(b.amount),
     decision,
-    statusLabel: decision,
-    verificationType: isAllow ? 'proof' : 'violation',
+    reason: b.reason || '',
     merchant: b.merchant,
-    mcc: `${b.merchant_category} · ${b.purpose}`,
+    merchant_category: b.merchant_category,
+    purpose: b.purpose,
+    mandate_id: b.mandate_id ?? null,
+    delegation_id: b.delegation_id ?? null,
+    created_at: b.created_at,
+    time: timeAgo(b.created_at),
     timestamp: formatTimestamp(b.created_at),
-    authorization_status: (b as any).authorization_status ?? null,
-    risk_score: (b as any).risk_score ?? null,
-    risk_level: (b as any).risk_level ?? null,
-    risk_factors: risk_factors ?? null,
+    authorization_status: b.authorization_status ?? null,
+    risk_score: b.risk_score ?? null,
+    risk_level: b.risk_level ?? null,
+    risk_factors: parseRiskFactors(b.risk_factors),
+    action: `${b.purpose} (${b.merchant})`,
+    mcc: b.merchant_category,
+    statusLabel: decision,
   };
 }
 
@@ -358,16 +232,11 @@ function mapBackendDelegation(b: BackendDelegation, agentMap: Map<string, string
 }
 
 // ---------------------------------------------------------------------------
-// Public API — live only (no silent mock fallback — backend is source of truth)
+// Public API
 // ---------------------------------------------------------------------------
 export async function getAgents(): Promise<AgentNode[]> {
   const raw = await apiFetch<BackendAgent[]>('/agents');
   return raw.map(mapBackendAgent);
-}
-
-export async function getAgentById(id: string): Promise<AgentNode | undefined> {
-  const agents = await getAgents();
-  return agents.find((a) => a.id === id);
 }
 
 export async function getMandates(): Promise<MandateItem[]> {
@@ -379,11 +248,6 @@ export async function getMandates(): Promise<MandateItem[]> {
   return rawMandates.map((m) => mapBackendMandate(m, agentMap));
 }
 
-export async function getMandateById(id: string): Promise<MandateItem | undefined> {
-  const mandates = await getMandates();
-  return mandates.find((m) => m.id === id);
-}
-
 export async function getTransactions(): Promise<TransactionRecord[]> {
   const [rawTxs, rawAgents] = await Promise.all([
     apiFetch<BackendTransaction[]>('/transactions'),
@@ -391,35 +255,6 @@ export async function getTransactions(): Promise<TransactionRecord[]> {
   ]);
   const agentMap = new Map(rawAgents.map((a) => [a.id, a.name] as const));
   return rawTxs.map((t) => mapBackendTransaction(t, agentMap));
-}
-
-export async function getTransactionById(id: string): Promise<TransactionRecord | undefined> {
-  const txs = await getTransactions();
-  return txs.find((t) => t.id === id);
-}
-
-export async function getProvenanceSteps(): Promise<AuditStep[]> {
-  // Phase 2: no backend provenance yet — keep mock
-  return [...PROVENANCE_STEPS];
-}
-
-export async function verifyTransaction(txId: string) {
-  const txs = await getTransactions();
-  const tx = txs.find((t) => t.id === txId);
-  if (!tx) throw new Error(`Transaction ${txId} not found`);
-  const isAllow = tx.decision === 'ALLOW';
-  return {
-    tx,
-    decision: tx.decision,
-    latencyMs: 8.4,
-    rules: [
-      { rule: 'MCC_ALLOWLIST', status: isAllow ? ('PASSED' as const) : ('VIOLATION' as const) },
-      { rule: 'SPENDING_CAP_MANDATE_4091', status: isAllow ? ('PASSED' as const) : ('VIOLATION' as const) },
-      { rule: 'DELEGATION_DEPTH', status: 'PASSED' as const },
-      { rule: 'TEMPORAL_VALIDITY', status: 'PASSED' as const },
-    ],
-    provenance: PROVENANCE_STEPS,
-  };
 }
 
 export async function healthCheck(): Promise<{ ok: boolean; mode: 'mock' | 'live' }> {
@@ -431,26 +266,16 @@ export async function healthCheck(): Promise<{ ok: boolean; mode: 'mock' | 'live
   }
 }
 
-// ---------------------------------------------------------------------------
-// Create helpers — return rich frontend types after creation
-// ---------------------------------------------------------------------------
 export interface CreateAgentPayload {
   name: string;
   description?: string;
-  // UI convenience — not persisted as separate columns but encoded in description
-  capAmount?: number;
-  mccList?: string;
+  domain?: string;
 }
 
 export async function createAgent(payload: CreateAgentPayload): Promise<AgentNode> {
-  const description =
-    payload.description ||
-    (payload.capAmount || payload.mccList
-      ? `Cap ₹${payload.capAmount ?? 5000}, MCCs: ${payload.mccList ?? '5411'}`
-      : `${payload.name} agent`);
   const raw = await apiFetch<BackendAgent>('/agents', {
     method: 'POST',
-    body: JSON.stringify({ name: payload.name, description }),
+    body: JSON.stringify({ name: payload.name, description: payload.description || '', domain: payload.domain || 'OTHER' }),
   });
   return mapBackendAgent(raw);
 }
@@ -461,7 +286,7 @@ export interface CreateMandatePayload {
   max_amount: number;
   merchant_category: string;
   currency?: string;
-  expires_at?: string | null; // ISO string
+  expires_at?: string | null;
 }
 
 export async function createMandate(payload: CreateMandatePayload): Promise<MandateItem> {
@@ -476,7 +301,6 @@ export async function createMandate(payload: CreateMandatePayload): Promise<Mand
       expires_at: payload.expires_at || null,
     }),
   });
-  // Need agent map for enrichment
   const agents = await apiFetch<BackendAgent[]>('/agents').catch(() => [] as BackendAgent[]);
   const agentMap = new Map(agents.map((a) => [a.id, a.name] as const));
   return mapBackendMandate(raw, agentMap);
@@ -493,7 +317,7 @@ export interface AuthorizePayload {
 
 export interface AuthorizeResult {
   transaction_id: string;
-  decision: 'ALLOW' | 'VERIFY'; // final
+  decision: 'ALLOW' | 'VERIFY';
   reason: string;
   delegation_id?: string | null;
   mandate_id?: string | null;
@@ -507,7 +331,7 @@ export interface AuthorizeResult {
 }
 
 export async function authorizePayment(payload: AuthorizePayload): Promise<AuthorizeResult> {
-  const raw = await apiFetch<any>('/payments/authorize', {
+  const raw = await apiFetch<Record<string, unknown>>('/payments/authorize', {
     method: 'POST',
     body: JSON.stringify({
       agent_id: payload.agent_id,
@@ -519,22 +343,21 @@ export async function authorizePayment(payload: AuthorizePayload): Promise<Autho
     }),
   });
   return {
-    transaction_id: raw.transaction_id,
+    transaction_id: String(raw.transaction_id),
     decision: raw.decision as AuthorizeResult['decision'],
-    reason: raw.reason,
-    delegation_id: raw.delegation_id ?? null,
-    mandate_id: raw.mandate_id ?? null,
-    chain: raw.chain ?? null,
-    authorization_status: raw.authorization_status ?? null,
-    authorization_reason: raw.authorization_reason ?? null,
-    risk_score: raw.risk_score ?? null,
-    risk_level: raw.risk_level ?? null,
-    risk_factors: raw.risk_factors ?? null,
-    final_decision: raw.final_decision ?? raw.decision ?? null,
+    reason: String(raw.reason || ''),
+    delegation_id: (raw.delegation_id as string | null) ?? null,
+    mandate_id: (raw.mandate_id as string | null) ?? null,
+    chain: (raw.chain as AuthorizeResult['chain']) ?? null,
+    authorization_status: (raw.authorization_status as string | null) ?? null,
+    authorization_reason: (raw.authorization_reason as string | null) ?? null,
+    risk_score: (raw.risk_score as number | null) ?? null,
+    risk_level: (raw.risk_level as string | null) ?? null,
+    risk_factors: (raw.risk_factors as AuthorizeResult['risk_factors']) ?? null,
+    final_decision: ((raw.final_decision ?? raw.decision) as string | null) ?? null,
   };
 }
 
-// Patch helpers for revoke flows (mirrors backend PATCH)
 export async function updateAgentStatus(agentId: string, status: 'ACTIVE' | 'REVOKED'): Promise<BackendAgent> {
   return apiFetch<BackendAgent>(`/agents/${agentId}`, {
     method: 'PATCH',
@@ -557,7 +380,7 @@ export async function updateMandateCap(mandateId: string, max_amount: number): P
 }
 
 // ---------------------------------------------------------------------------
-// Delegations — Phase 3
+// Delegations
 // ---------------------------------------------------------------------------
 export async function getDelegations(): Promise<DelegationItem[]> {
   const [rawDelegations, rawAgents, rawMandates] = await Promise.all([
@@ -572,7 +395,7 @@ export async function getDelegations(): Promise<DelegationItem[]> {
 
 export async function getDelegationChain(agentId: string): Promise<DelegationChain> {
   try {
-    const raw = await apiFetch<any>(`/delegations/chain/${agentId}`);
+    const raw = await apiFetch<{ delegation_id?: string | null; chain?: DelegationChain['chain']; root_mandate?: unknown; delegation?: BackendDelegation | null }>('/delegations/chain/' + encodeURIComponent(agentId));
     return {
       delegationId: raw.delegation_id ?? null,
       chain: raw.chain ?? [],
@@ -616,38 +439,105 @@ export async function updateDelegationStatus(delegationId: string, status: 'ACTI
 }
 
 // ---------------------------------------------------------------------------
-// Provenance — Phase 5
+// Provenance
 // ---------------------------------------------------------------------------
 export async function getProvenance(limit = 100, offset = 0): Promise<ProvenanceEvent[]> {
   return apiFetch<ProvenanceEvent[]>(`/provenance?limit=${limit}&offset=${offset}`);
 }
 
 export async function getProvenanceByTransaction(transactionId: string): Promise<ProvenanceEvent[]> {
-  return apiFetch<ProvenanceEvent[]>(`/provenance/transaction/${transactionId}`);
+  return apiFetch<ProvenanceEvent[]>(`/provenance/transaction/${encodeURIComponent(transactionId)}`);
 }
 
 export async function verifyProvenance(): Promise<ProvenanceVerifyResult> {
   return apiFetch<ProvenanceVerifyResult>('/provenance/verify');
 }
 
-export async function getProvenanceEvent(eventId: string): Promise<ProvenanceEvent> {
-  return apiFetch<ProvenanceEvent>(`/provenance/event/${eventId}`);
+// ---------------------------------------------------------------------------
+// Tasks + Approvals — Phase 2
+// ---------------------------------------------------------------------------
+export interface TaskAuthorizePayload {
+  domain_agent_id: string;
+  purpose: string;
+  requested_amount: number;
+  category: string;
+  merchant: string;
+  currency?: string;
+  idempotency_key?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Merchant Reputation — Phase 7 (adapted from Iron scam_registry)
-// ---------------------------------------------------------------------------
-export async function reportMerchant(merchant: string, reason: string, reporter = "anonymous"): Promise<any> {
-  return apiFetch<any>('/merchants/report', {
+export interface TaskAuthorizeResult {
+  task: TaskItem;
+  approval: ApprovalItem | null;
+  /** Plaintext one-time token — returned exactly once, only with a new approval. */
+  approval_token: string | null;
+}
+
+export async function authorizeTask(payload: TaskAuthorizePayload): Promise<TaskAuthorizeResult> {
+  return apiFetch<TaskAuthorizeResult>('/tasks/authorize', {
     method: 'POST',
-    body: JSON.stringify({ merchant, reason, reporter }),
+    body: JSON.stringify({
+      domain_agent_id: payload.domain_agent_id,
+      purpose: payload.purpose,
+      requested_amount: payload.requested_amount,
+      category: payload.category,
+      merchant: payload.merchant,
+      currency: payload.currency || 'INR',
+      idempotency_key: payload.idempotency_key || null,
+    }),
   });
 }
 
-export async function getMerchantReputation(merchant: string): Promise<any> {
-  return apiFetch<any>(`/merchants/reputation/${encodeURIComponent(merchant)}`);
+export async function getTasks(status?: string): Promise<TaskItem[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  return apiFetch<TaskItem[]>(`/tasks${q}`);
 }
 
-export async function getFlaggedMerchants(min_count = 1): Promise<any[]> {
-  return apiFetch<any[]>(`/merchants/flagged?min_count=${min_count}`);
+export async function getTask(taskId: string): Promise<TaskItem> {
+  return apiFetch<TaskItem>(`/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export async function cancelTask(taskId: string): Promise<TaskItem> {
+  return apiFetch<TaskItem>(`/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' });
+}
+
+export async function getApprovals(status?: string, taskId?: string): Promise<ApprovalItem[]> {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  if (taskId) params.set('task_id', taskId);
+  const q = params.toString() ? `?${params.toString()}` : '';
+  return apiFetch<ApprovalItem[]>(`/approvals${q}`);
+}
+
+export async function resolveApproval(approvalId: string, token: string, action: 'approve' | 'deny'): Promise<ApprovalItem> {
+  return apiFetch<ApprovalItem>(`/approvals/${encodeURIComponent(approvalId)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ token, action }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Mock payments — Phase 3 (simulated execution for APPROVED tasks only)
+// ---------------------------------------------------------------------------
+export async function createMockPayment(taskId: string, paymentMethod = 'Demo Balance', note?: string): Promise<MockPaymentItem> {
+  return apiFetch<MockPaymentItem>('/mock-payments/create', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId, payment_method: paymentMethod, note: note || null }),
+  });
+}
+
+export async function executeMockPayment(paymentId: string, simulateFailure = false): Promise<MockPaymentItem> {
+  return apiFetch<MockPaymentItem>(`/mock-payments/${encodeURIComponent(paymentId)}/execute`, {
+    method: 'POST',
+    body: JSON.stringify({ simulate_failure: simulateFailure }),
+  });
+}
+
+export async function getMockPayment(paymentId: string): Promise<MockPaymentItem> {
+  return apiFetch<MockPaymentItem>(`/mock-payments/${encodeURIComponent(paymentId)}`);
+}
+
+export async function getMockPayments(taskId?: string): Promise<MockPaymentItem[]> {
+  const q = taskId ? `?task_id=${encodeURIComponent(taskId)}` : '';
+  return apiFetch<MockPaymentItem[]>(`/mock-payments${q}`);
 }

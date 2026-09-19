@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { AgentNode, MandateItem } from '../types';
+import { Modal, inputClass, labelClass } from './ui';
 
 interface CreateDelegationModalProps {
   isOpen: boolean;
@@ -10,175 +11,153 @@ interface CreateDelegationModalProps {
 }
 
 export const CreateDelegationModal: React.FC<CreateDelegationModalProps> = ({ isOpen, onClose, agents, mandates, onCreate }) => {
-  const [parentAgentId, setParentAgentId] = useState(agents.find((a) => a.id === 'shopping-agent')?.id || agents[0]?.id || '');
-  const [childAgentId, setChildAgentId] = useState(agents.find((a) => a.id === 'payment-agent')?.id || agents[1]?.id || '');
-  const [parentMandateId, setParentMandateId] = useState('');
+  const activeAgents = useMemo(() => agents.filter((a) => a.status === 'ACTIVE' && !a.is_task_agent), [agents]);
+  const [parentId, setParentId] = useState(activeAgents[0]?.id || '');
+  const [childId, setChildId] = useState(activeAgents[1]?.id || activeAgents[0]?.id || '');
+  const [mandateId, setMandateId] = useState('');
   const [amount, setAmount] = useState('1000');
-  const [purpose, setPurpose] = useState('Groceries');
-  const [merchantCategory, setMerchantCategory] = useState('Grocery');
-  const [expiresAt, setExpiresAt] = useState('');
-  const [submitting, setSubmitting] = useState(false);
+  const [purpose, setPurpose] = useState('');
+  const [category, setCategory] = useState('');
+  const [expiryDate, setExpiryDate] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  // Auto-select first mandate for parent
-  const parentMandates = mandates.filter((m) => {
-    const agent = agents.find((a) => a.id === parentAgentId);
-    return agent ? m.boundAgent === agent.name && m.status === 'ACTIVE' : false;
-  });
+  const parentMandates = useMemo(() => mandates.filter((m) => {
+    const agent = agents.find((a) => a.id === parentId);
+    return agent ? m.agent_id === parentId && m.status === 'ACTIVE' : false;
+  }), [mandates, parentId, agents]);
 
   useEffect(() => {
-    if (parentMandates.length > 0 && !parentMandates.find((m) => m.id === parentMandateId)) {
-      setParentMandateId(parentMandates[0].id);
-      // Prefill amount/purpose from mandate
-      setAmount(String(Math.min(1000, parentMandates[0].cap)));
-      setPurpose(parentMandates[0].name);
-      const cat = parentMandates[0].mccCode.replace(/^MCC\s*/i, '');
-      setMerchantCategory(cat || 'Grocery');
+    if (!isOpen) return;
+    if (activeAgents.length > 0) {
+      if (!activeAgents.find((a) => a.id === parentId)) setParentId(activeAgents[0].id);
+      const childOptions = activeAgents.filter((a) => a.id !== parentId);
+      if (childOptions.length > 0 && !childOptions.find((a) => a.id === childId)) setChildId(childOptions[0].id);
     }
-  }, [parentAgentId, mandates, agents, parentMandateId, parentMandates]);
+  }, [isOpen, agents, activeAgents, parentId, childId]);
 
-  // Keep child != parent
   useEffect(() => {
-    if (childAgentId === parentAgentId && agents.length > 1) {
-      const other = agents.find((a) => a.id !== parentAgentId);
-      if (other) setChildAgentId(other.id);
+    if (parentMandates.length > 0 && !parentMandates.find((m) => m.id === mandateId)) {
+      const first = parentMandates[0];
+      setMandateId(first.id);
+      setAmount(String(Math.min(1000, first.max_amount)));
+      setPurpose(first.purpose);
+      setCategory(first.merchant_category);
     }
-  }, [parentAgentId, childAgentId, agents]);
+  }, [parentMandates, mandateId]);
 
   if (!isOpen) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (!parentAgentId || !childAgentId || !parentMandateId) {
-      setError('Select parent, child and mandate.');
+    if (!parentId || !childId || !mandateId) {
+      setError('Select a parent agent, a child agent, and the parent rule.');
       return;
     }
-    if (parentAgentId === childAgentId) {
-      setError('Parent and child must be different.');
+    if (parentId === childId) {
+      setError('Parent and child must be different agents.');
       return;
+    }
+    const limit = parseFloat(amount);
+    if (!limit || limit <= 0) {
+      setError('Enter a delegated limit greater than zero.');
+      return;
+    }
+    let expiresIso: string | null = null;
+    if (expiryDate) {
+      const d = new Date(expiryDate + 'T23:59:59');
+      if (isNaN(d.getTime())) {
+        setError('Pick a valid expiry date, or leave it empty.');
+        return;
+      }
+      expiresIso = d.toISOString();
     }
     setSubmitting(true);
     try {
-      let expiresIso: string | null = null;
-      if (expiresAt.trim()) {
-        const parsed = Date.parse(expiresAt);
-        if (isNaN(parsed)) {
-          setError('Invalid expiry date.');
-          setSubmitting(false);
-          return;
-        }
-        expiresIso = new Date(parsed).toISOString();
-      }
       await onCreate({
-        parent_agent_id: parentAgentId,
-        child_agent_id: childAgentId,
-        parent_mandate_id: parentMandateId,
-        delegated_amount_limit: parseFloat(amount) || 0,
-        purpose: purpose.trim(),
-        merchant_category: merchantCategory.trim(),
+        parent_agent_id: parentId,
+        child_agent_id: childId,
+        parent_mandate_id: mandateId,
+        delegated_amount_limit: limit,
+        purpose: purpose.trim() || 'Delegated spending',
+        merchant_category: category.trim() || 'General',
         expires_at: expiresIso,
       });
       onClose();
-    } catch (err: any) {
-      setError(err.message || 'Failed to create delegation');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not create the delegation.');
     } finally {
       setSubmitting(false);
     }
   };
 
+  const childOptions = activeAgents.filter((a) => a.id !== parentId);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#131b2e]/60 p-4 animate-in fade-in">
-      <div className="w-full max-w-lg rounded-xl bg-[#ffffff] shadow-2xl p-6 space-y-4 border border-[#c6c6cd]/30">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-[#0051d5] text-[22px]">account_tree</span>
-            <h3 className="font-headline-lg text-[20px] text-[#0b1c30] font-semibold">Create Delegation</h3>
-          </div>
-          <button onClick={onClose} className="text-[#45464d] hover:text-[#0b1c30] cursor-pointer">
-            <span className="material-symbols-outlined text-[20px]">close</span>
-          </button>
-        </div>
-        <p className="font-body-sm text-[12px] text-[#45464d]">
-          Delegate a bounded subset of authority. Child limit and purpose must be <span className="font-semibold text-[#0b1c30]">≤ parent</span>.
-        </p>
-
-        {error && <div className="p-2 rounded bg-[#ffdad6] border border-[#ba1a1a]/30 text-[#93000a] text-[12px] font-mono">{error}</div>}
-
-        <form onSubmit={handleSubmit} className="space-y-3.5">
+    <Modal onClose={onClose}>
+      <h3 className="text-[16px] font-semibold text-[#0b1c30]">New delegation</h3>
+      <p className="text-[13px] text-[#5a5c63] mt-1">How much authority is passed from one agent to another? The child can never exceed the parent rule.</p>
+      {error && <p className="mt-3 text-[13px] text-[#93000a] bg-[#fdf3f2] border border-[#e8c4c0] rounded-lg px-3 py-2">{error}</p>}
+      {activeAgents.length < 2 ? (
+        <p className="mt-4 text-[13px] text-[#76777d]">You need at least two active agents to create a delegation.</p>
+      ) : (
+        <form onSubmit={submit} className="space-y-3.5 mt-4">
           <div className="grid grid-cols-2 gap-3">
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Parent Agent (A)</label>
-              <select value={parentAgentId} onChange={(e) => setParentAgentId(e.target.value)} className="px-3 py-2 bg-[#eff4ff] rounded text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff] cursor-pointer">
-                {agents
-                  .filter((a) => a.status === 'ACTIVE')
-                  .map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name} ({a.status})
-                    </option>
-                  ))}
+            <div>
+              <label className={labelClass()}>From (parent)</label>
+              <select value={parentId} onChange={(e) => setParentId(e.target.value)} className={`${inputClass()} mt-1 cursor-pointer`}>
+                {activeAgents.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
               </select>
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Child Agent (B)</label>
-              <select value={childAgentId} onChange={(e) => setChildAgentId(e.target.value)} className="px-3 py-2 bg-[#eff4ff] rounded text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff] cursor-pointer">
-                {agents
-                  .filter((a) => a.id !== parentAgentId)
-                  .map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name} ({a.status})
-                    </option>
-                  ))}
+            <div>
+              <label className={labelClass()}>To (child)</label>
+              <select value={childId} onChange={(e) => setChildId(e.target.value)} className={`${inputClass()} mt-1 cursor-pointer`}>
+                {childOptions.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
               </select>
             </div>
           </div>
-
-          <div className="flex flex-col gap-1">
-            <label className="text-[12px] text-[#0b1c30] font-medium">Parent Mandate</label>
-            <select value={parentMandateId} onChange={(e) => setParentMandateId(e.target.value)} className="px-3 py-2 bg-[#eff4ff] rounded text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff] cursor-pointer">
-              {parentMandates.length === 0 && <option value="">No active mandate for parent</option>}
+          <div>
+            <label className={labelClass()}>Parent rule</label>
+            <select value={mandateId} onChange={(e) => setMandateId(e.target.value)} className={`${inputClass()} mt-1 cursor-pointer`}>
+              {parentMandates.length === 0 && <option value="">No active rule for this parent</option>}
               {parentMandates.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.code} — {m.name} (₹{m.cap.toLocaleString()} {m.mccCode})
-                </option>
+                <option key={m.id} value={m.id}>{m.purpose} — ₹{m.max_amount.toLocaleString()} · {m.merchant_category}</option>
               ))}
             </select>
-            <span className="text-[11px] text-[#76777d] font-mono">Root mandate that authorizes the parent. Child ⊆ parent.</span>
           </div>
-
           <div className="grid grid-cols-2 gap-3">
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Delegated Limit (INR)</label>
-              <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} required className="px-3 py-2 bg-[#eff4ff] rounded font-mono text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff]" />
+            <div>
+              <label className={labelClass()}>Delegated limit (₹)</label>
+              <input type="number" min="1" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} className={`${inputClass()} mt-1`} />
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Expires At (optional)</label>
-              <input type="date" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} className="px-3 py-2 bg-[#eff4ff] rounded text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff]" />
+            <div>
+              <label className={labelClass()}>Expires (optional)</label>
+              <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} className={`${inputClass()} mt-1`} />
             </div>
           </div>
-
           <div className="grid grid-cols-2 gap-3">
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Purpose</label>
-              <input value={purpose} onChange={(e) => setPurpose(e.target.value)} required placeholder="Groceries" className="px-3 py-2 bg-[#eff4ff] rounded text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff]" />
+            <div>
+              <label className={labelClass()}>Purpose</label>
+              <input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Groceries" className={`${inputClass()} mt-1`} />
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] text-[#0b1c30] font-medium">Merchant Category</label>
-              <input value={merchantCategory} onChange={(e) => setMerchantCategory(e.target.value)} required placeholder="Grocery" className="px-3 py-2 bg-[#eff4ff] rounded font-mono text-[13px] text-[#0b1c30] outline-none border border-[#c6c6cd]/40 focus:border-[#0051d5] focus:bg-[#ffffff]" />
+            <div>
+              <label className={labelClass()}>Category</label>
+              <input value={category} onChange={(e) => setCategory(e.target.value)} placeholder="e.g. Grocery" className={`${inputClass()} mt-1`} />
             </div>
           </div>
-
-          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#c6c6cd]/20">
-            <button type="button" onClick={onClose} disabled={submitting} className="px-4 py-2 rounded text-[12px] font-medium text-[#0b1c30] hover:bg-[#e5eeff] transition-colors cursor-pointer disabled:opacity-60">
-              Cancel
-            </button>
-            <button type="submit" disabled={submitting} className="px-4 py-2 rounded text-[12px] font-medium bg-[#000000] text-[#ffffff] hover:opacity-90 transition-opacity cursor-pointer shadow-sm flex items-center gap-1.5 disabled:opacity-60">
-              <span className="material-symbols-outlined text-[16px]">{submitting ? 'hourglass_empty' : 'account_tree'}</span>
-              <span>{submitting ? 'Delegating…' : 'Create Delegation'}</span>
+          <div className="flex justify-end gap-2 pt-2">
+            <button type="button" onClick={onClose} disabled={submitting} className="px-4 py-2 rounded-lg text-[13px] font-medium text-[#0b1c30] bg-[#eef1f6] hover:bg-[#e2e7f0] cursor-pointer disabled:opacity-60">Cancel</button>
+            <button type="submit" disabled={submitting} className="px-4 py-2 rounded-lg text-[13px] font-medium bg-[#0b1c30] text-white hover:opacity-90 cursor-pointer disabled:opacity-60">
+              {submitting ? 'Creating…' : 'Create delegation'}
             </button>
           </div>
         </form>
-      </div>
-    </div>
+      )}
+    </Modal>
   );
 };

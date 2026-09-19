@@ -7,9 +7,13 @@ import json
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
+VALID_AGENT_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "OTHER")
+
+
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, example="Shopping Agent")
     description: Optional[str] = Field(None, example="Handles grocery purchases")
+    domain: Optional[str] = Field(None, example="FOOD")
 
     @field_validator("name", mode="before")
     @classmethod
@@ -23,12 +27,24 @@ class AgentCreate(BaseModel):
     def strip_name(cls, v: str):
         return v.strip() if isinstance(v, str) else v
 
+    @field_validator("domain", mode="before")
+    @classmethod
+    def normalize_domain(cls, v: Any):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "OTHER"
+        norm = str(v).strip().upper()
+        if norm not in VALID_AGENT_DOMAINS:
+            raise ValueError(f"domain must be one of {VALID_AGENT_DOMAINS}")
+        return norm
+
 
 class AgentResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
     status: str
+    domain: str = "OTHER"
+    is_task_agent: bool = False
     created_at: datetime
 
     class Config:
@@ -230,6 +246,156 @@ class ProvenanceVerifyResponse(BaseModel):
     actual_previous: Optional[str] = None
     expected_hash: Optional[str] = None
     actual_hash: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Tasks + Approvals — Phase 2
+# ---------------------------------------------------------------------------
+TASK_TTL_HOURS = 6
+
+VALID_TASK_STATUSES = ("PENDING", "APPROVED", "NEEDS_REVIEW", "COMPLETED", "CANCELLED", "EXPIRED")
+VALID_APPROVAL_STATUSES = ("PENDING", "APPROVED", "DENIED", "EXPIRED")
+
+
+def _strip_non_empty(v: Any, field_name: str) -> Any:
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            raise ValueError(f"{field_name} must not be empty or whitespace only")
+    return v
+
+
+class TaskAuthorizeRequest(BaseModel):
+    domain_agent_id: str = Field(..., example="shopping-agent")
+    purpose: str = Field(..., min_length=1, max_length=200, example="Dinner")
+    requested_amount: float = Field(..., gt=0, example=800)
+    category: str = Field(..., min_length=1, max_length=100, example="Grocery")
+    merchant: str = Field(..., min_length=1, max_length=200, example="Swiggy")
+    currency: Optional[str] = Field("INR", example="INR")
+    idempotency_key: Optional[str] = Field(None, example="task-idem-123")
+
+    @field_validator("purpose", "category", "merchant", mode="before")
+    @classmethod
+    def check_text_fields(cls, v: Any):
+        return _strip_non_empty(v, "field")
+
+    @field_validator("idempotency_key", mode="before")
+    @classmethod
+    def strip_idempotency_key(cls, v: Any):
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("idempotency_key must be <= 64 characters")
+        return v
+
+
+class ApprovalResponse(BaseModel):
+    id: str
+    task_id: str
+    transaction_id: Optional[str] = None
+    amount: float
+    reason: str
+    risk_level: Optional[str] = None
+    status: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TaskResponse(BaseModel):
+    id: str
+    domain_agent_id: str
+    task_agent_id: Optional[str] = None
+    purpose: str
+    requested_amount: float
+    task_limit: float
+    category: str
+    merchant: str
+    status: str
+    delegation_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    # Engine outcome for this task (ALLOW = approved, VERIFY = needs review)
+    decision: Optional[str] = None
+    reason: Optional[str] = None
+    authorization_status: Optional[str] = None
+    risk_score: Optional[int] = None
+    risk_level: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TaskAuthorizeResponse(BaseModel):
+    task: TaskResponse
+    approval: Optional[ApprovalResponse] = None
+    # Plaintext one-time token — returned EXACTLY ONCE at creation when an
+    # approval is required. Never stored, never returned again.
+    approval_token: Optional[str] = None
+
+
+class ApprovalResolveRequest(BaseModel):
+    token: str = Field(..., min_length=1, example="opaque-token")
+    action: str = Field(..., example="approve")
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def check_action(cls, v: Any):
+        norm = str(v).strip().lower() if isinstance(v, str) else v
+        if norm not in ("approve", "deny"):
+            raise ValueError("action must be 'approve' or 'deny'")
+        return norm
+
+
+# ---------------------------------------------------------------------------
+# Mock payments — Phase 3 (simulated execution for APPROVED tasks only)
+# ---------------------------------------------------------------------------
+VALID_MOCK_PAYMENT_STATUSES = ("CREATED", "PROCESSING", "SUCCEEDED", "FAILED")
+VALID_MOCK_PAYMENT_METHODS = ("Demo Balance",)
+
+
+class MockPaymentCreate(BaseModel):
+    task_id: str = Field(..., min_length=1, example="task-abc123")
+    payment_method: str = Field("Demo Balance", example="Demo Balance")
+    note: Optional[str] = Field(None, max_length=200, example="Dinner")
+
+    @field_validator("payment_method", mode="before")
+    @classmethod
+    def check_method(cls, v: Any):
+        norm = str(v).strip() if isinstance(v, str) else v
+        if norm not in VALID_MOCK_PAYMENT_METHODS:
+            raise ValueError(f"payment_method must be one of {VALID_MOCK_PAYMENT_METHODS}")
+        return norm
+
+
+class MockPaymentExecute(BaseModel):
+    # Demo-harness control for exercising the failure path in tests/demos.
+    # The UI never sends this; production behavior is always success.
+    simulate_failure: bool = Field(False, example=False)
+
+
+class MockPaymentResponse(BaseModel):
+    id: str
+    task_id: str
+    transaction_id: Optional[str] = None
+    merchant: str
+    amount: float
+    currency: str
+    status: str
+    payment_method: str
+    note: Optional[str] = None
+    failure_reason: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
 
 
 # ---------------------------------------------------------------------------

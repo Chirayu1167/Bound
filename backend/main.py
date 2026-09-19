@@ -5,8 +5,10 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import json
 import hashlib
+import hmac
 import logging
 import os
+import secrets
 
 logger = logging.getLogger("bound")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -21,7 +23,15 @@ from backend.services import risk as risk_service
 # Ensure models registered
 import backend.models  # noqa: F401
 
-_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173").split(",")
+_cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:3001,http://127.0.0.1:3001,"
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost:5174,http://127.0.0.1:5174,"
+    "http://localhost:4173,http://127.0.0.1:4173,"
+    "http://localhost:8080,http://127.0.0.1:8080",
+).split(",")
 _cors_origins = [o.strip() for o in _cors_origins if o.strip()]
 
 app = FastAPI(
@@ -34,6 +44,16 @@ app = FastAPI(
 
 # CORS — from env or safe defaults for local dev; do not use wildcard with credentials
 # If wildcard is explicitly requested, disable credentials (wildcard + credentials is invalid)
+#
+# Deployment guard: in production the allowed origins must come explicitly
+# from CORS_ORIGINS. Falling back to localhost defaults or "*" would either
+# break the deployed frontend (CORS-blocked) or open the API to any origin.
+if os.getenv("ENV", "development") == "production":
+    _explicit_cors = os.getenv("CORS_ORIGINS")
+    if not _explicit_cors or not _explicit_cors.strip():
+        raise RuntimeError("Refusing to boot: ENV=production requires CORS_ORIGINS to be set explicitly (no localhost default in production).")
+    if "*" in [o.strip() for o in _explicit_cors.split(",") if o.strip()]:
+        raise RuntimeError("Refusing to boot: ENV=production forbids CORS_ORIGINS='*' (set the real frontend origin).")
 if "*" in _cors_origins:
     _allow_credentials = False
     _allow_origins = ["*"]
@@ -121,6 +141,22 @@ def _gen_delegation_id() -> str:
     return f"del-{uuid.uuid4().hex[:6]}"
 
 
+def _gen_task_id() -> str:
+    return f"task-{uuid.uuid4().hex[:6]}"
+
+
+def _gen_approval_id() -> str:
+    return f"apr-{uuid.uuid4().hex[:6]}"
+
+
+def _gen_payment_id() -> str:
+    return f"pay-{uuid.uuid4().hex[:6]}"
+
+
+def _hash_approval_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def _compute_idempotency_hash(payload: schemas.AuthorizeRequest) -> str:
     """Deterministic hash of logical request (excluding idempotency_key itself)."""
     # Use canonical JSON of the logical fields
@@ -189,17 +225,24 @@ def _record_provenance(
         return None
 
 
-def _create_agent_internal(payload: schemas.AgentCreate, db: Session) -> models.Agent:
+def _create_agent_internal(
+    payload: schemas.AgentCreate, db: Session, *, is_task_agent: bool = False
+) -> models.Agent:
     base_id = _gen_agent_id(payload.name)
     agent_id = base_id
     existing = db.query(models.Agent).filter(models.Agent.id == agent_id).first()
     if existing:
         agent_id = f"{base_id}-{uuid.uuid4().hex[:4]}"
+    domain = (payload.domain or "OTHER").upper()
+    if domain not in ("FOOD", "TRAVEL", "SHOPPING", "OTHER"):
+        raise HTTPException(status_code=400, detail=f"Invalid domain {payload.domain}")
     agent = models.Agent(
         id=agent_id,
         name=payload.name,
         description=payload.description or "",
         status="ACTIVE",
+        domain=domain,
+        is_task_agent=is_task_agent,
         created_at=datetime.now(timezone.utc),
     )
     db.add(agent)
@@ -475,6 +518,382 @@ def _authorize_internal(payload: schemas.AuthorizeRequest, db: Session) -> schem
 
 
 # ---------------------------------------------------------------------------
+# Tasks + Approvals — Phase 2
+#
+# A task is one user request handled by a persistent domain agent. All
+# authority flows through the EXISTING engine: delegation creation,
+# effective authority, authorization, risk, revocation, expiry. Nothing here
+# duplicates those checks — this layer only orchestrates them and adds the
+# task/approval records plus single-use ephemeral machinery on top.
+# ---------------------------------------------------------------------------
+TASK_TTL = timedelta(hours=6)
+
+
+def _task_is_expired(task: models.Task, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    exp = task.expires_at
+    if exp is None:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return now > exp
+
+
+def _map_task_outcome(authorization_status: str | None, risk_level: str | None) -> tuple[str, bool]:
+    """Pure mapping: (task_status, needs_approval).
+
+    Risk NEVER grants authority:
+    - ALLOW + LOW -> APPROVED (no approval needed)
+    - ALLOW + MEDIUM/HIGH -> NEEDS_REVIEW (risk escalation)
+    - VERIFY + anything -> NEEDS_REVIEW (authorization is the hard boundary)
+    """
+    if authorization_status == "ALLOW" and (risk_level or "LOW") == "LOW":
+        return "APPROVED", False
+    return "NEEDS_REVIEW", True
+
+
+def _revoke_task_authority(db: Session, task: models.Task, reason: str) -> None:
+    """Single-use / terminal cleanup: revoke the task delegation and the
+    ephemeral task agent if they are still ACTIVE. History is preserved."""
+    if task.delegation_id:
+        d = db.query(models.Delegation).filter(models.Delegation.id == task.delegation_id).first()
+        if d is not None and d.status == "ACTIVE":
+            d.status = "REVOKED"
+            _record_provenance(
+                db,
+                event_type="DELEGATION_REVOKED",
+                delegation_id=d.id,
+                parent_agent_id=d.parent_agent_id,
+                actor_agent_id=d.child_agent_id,
+                mandate_id=d.parent_mandate_id,
+                reason=reason,
+                event_data={"parent_agent_id": d.parent_agent_id, "child_agent_id": d.child_agent_id},
+            )
+    if task.task_agent_id:
+        a = db.query(models.Agent).filter(models.Agent.id == task.task_agent_id).first()
+        if a is not None and a.status == "ACTIVE":
+            a.status = "REVOKED"
+            _record_provenance(
+                db,
+                event_type="AGENT_REVOKED",
+                actor_agent_id=a.id,
+                reason=reason,
+                event_data={"task_id": task.id},
+            )
+    db.commit()
+
+
+def _expire_task_and_approval(
+    db: Session, task: models.Task, approval: models.Approval | None, reason: str
+) -> None:
+    task.status = "EXPIRED"
+    _revoke_task_authority(db, task, reason)
+    if approval is not None and approval.status == "PENDING":
+        approval.status = "EXPIRED"
+    _record_provenance(
+        db,
+        event_type="TASK_EXPIRED",
+        actor_agent_id=task.domain_agent_id,
+        mandate_id=None,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        reason=reason,
+        event_data={"task_id": task.id},
+    )
+    db.commit()
+
+
+def _create_task_agent_internal(db: Session, domain_agent: models.Agent, purpose: str, task_id: str) -> models.Agent:
+    name = f"{domain_agent.name} task: {purpose}"[:90]
+    payload = schemas.AgentCreate(
+        name=name,
+        description=f"Ephemeral task agent for {task_id} — auto-expires, single task only",
+        domain=domain_agent.domain or "OTHER",
+    )
+    return _create_agent_internal(payload, db, is_task_agent=True)
+
+
+def _task_to_response(db: Session, task: models.Task) -> schemas.TaskResponse:
+    decision = None
+    reason = None
+    authorization_status = None
+    risk_score = None
+    risk_level = None
+    if task.transaction_id:
+        tx = db.query(models.Transaction).filter(models.Transaction.id == task.transaction_id).first()
+        if tx is not None:
+            decision = tx.decision
+            reason = tx.reason
+            authorization_status = tx.authorization_status
+            risk_score = tx.risk_score
+            risk_level = tx.risk_level
+    return schemas.TaskResponse(
+        id=task.id,
+        domain_agent_id=task.domain_agent_id,
+        task_agent_id=task.task_agent_id,
+        purpose=task.purpose,
+        requested_amount=task.requested_amount,
+        task_limit=task.task_limit,
+        category=task.category,
+        merchant=task.merchant,
+        status=task.status,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        created_at=task.created_at,
+        expires_at=task.expires_at,
+        decision=decision,
+        reason=reason,
+        authorization_status=authorization_status,
+        risk_score=risk_score,
+        risk_level=risk_level,
+    )
+
+
+def _compute_task_request_hash(payload: schemas.TaskAuthorizeRequest) -> str:
+    data = {
+        "domain_agent_id": payload.domain_agent_id,
+        "requested_amount": float(payload.requested_amount),
+        "merchant": (payload.merchant or "").strip(),
+        "category": (payload.category or "").strip().lower(),
+        "purpose": (payload.purpose or "").strip().lower(),
+        "currency": (payload.currency or "INR").strip().upper(),
+    }
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _execute_task_authorize(
+    payload: schemas.TaskAuthorizeRequest,
+    db: Session,
+) -> schemas.TaskAuthorizeResponse:
+    """One task authorization. Creates the task, single-use task machinery
+    when within authority, runs the existing engine exactly once, maps the
+    outcome, and creates a one-time approval when review is required."""
+    now = datetime.now(timezone.utc)
+    task_expires = now + TASK_TTL
+
+    agent = db.query(models.Agent).filter(models.Agent.id == payload.domain_agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent {payload.domain_agent_id} not found")
+    if agent.is_task_agent:
+        raise HTTPException(status_code=400, detail="Task agents cannot own tasks")
+
+    task_id = _gen_task_id()
+    while db.query(models.Task).filter(models.Task.id == task_id).first():
+        task_id = _gen_task_id()
+    task = models.Task(
+        id=task_id,
+        domain_agent_id=agent.id,
+        task_agent_id=None,
+        purpose=payload.purpose,
+        requested_amount=float(payload.requested_amount),
+        task_limit=0,  # authority granted below; 0 until a delegation exists
+        category=payload.category,
+        merchant=payload.merchant,
+        status="PENDING",
+        delegation_id=None,
+        transaction_id=None,
+        created_at=now,
+        expires_at=task_expires,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    _record_provenance(
+        db,
+        event_type="TASK_CREATED",
+        actor_agent_id=agent.id,
+        reason=f"Task requested: {payload.purpose} up to ₹{payload.requested_amount} at {payload.merchant}",
+        event_data={
+            "task_id": task.id,
+            "purpose": payload.purpose,
+            "requested_amount": float(payload.requested_amount),
+            "category": payload.category,
+            "merchant": payload.merchant,
+        },
+    )
+
+    # Revoked domain agent: record the refusal, never grant, never approvable.
+    if agent.status != "ACTIVE":
+        auth_payload = schemas.AuthorizeRequest(
+            agent_id=agent.id,
+            amount=float(payload.requested_amount),
+            merchant=payload.merchant,
+            merchant_category=payload.category,
+            purpose=payload.purpose,
+            currency=payload.currency or "INR",
+        )
+        result = _authorize_internal(auth_payload, db)
+        task.transaction_id = result.transaction_id
+        task.status = "NEEDS_REVIEW"
+        db.commit()
+        return schemas.TaskAuthorizeResponse(task=_task_to_response(db, task), approval=None, approval_token=None)
+
+    # Budget check against effective authority (read-only — decides the path).
+    auth_decision, _auth_reason, mandate, _d, _c = evaluate_authorization(
+        db,
+        agent_id=agent.id,
+        amount=float(payload.requested_amount),
+        merchant_category=payload.category,
+        purpose=payload.purpose,
+    )
+
+    engine_agent_id = agent.id
+    if mandate is not None and auth_decision == "ALLOW":
+        # Within authority: build single-use ephemeral machinery through the
+        # EXISTING delegation engine (validates child ⊆ parent, scope, TTL).
+        try:
+            task_agent = _create_task_agent_internal(db, agent, payload.purpose, task.id)
+            deleg_expires = task_expires
+            if mandate.expires_at:
+                mexp = mandate.expires_at
+                if mexp.tzinfo is None:
+                    mexp = mexp.replace(tzinfo=timezone.utc)
+                deleg_expires = min(task_expires, mexp)
+            delegation = _create_delegation_internal(
+                schemas.DelegationCreate(
+                    parent_agent_id=agent.id,
+                    child_agent_id=task_agent.id,
+                    parent_mandate_id=mandate.id,
+                    delegated_amount_limit=float(payload.requested_amount),
+                    purpose=payload.purpose,
+                    merchant_category=payload.category,
+                    expires_at=deleg_expires,
+                ),
+                db,
+            )
+            task.task_agent_id = task_agent.id
+            task.delegation_id = delegation.id
+            task.task_limit = delegation.delegated_amount_limit
+            db.commit()
+            engine_agent_id = task_agent.id
+        except HTTPException:
+            # Delegation unexpectedly invalid (e.g. mandate expired between
+            # checks): fall through to the no-delegation NEEDS_REVIEW path.
+            db.rollback()
+            task = db.query(models.Task).filter(models.Task.id == task_id).first()
+
+    auth_payload = schemas.AuthorizeRequest(
+        agent_id=engine_agent_id,
+        amount=float(payload.requested_amount),
+        merchant=payload.merchant,
+        merchant_category=payload.category,
+        purpose=payload.purpose,
+        currency=payload.currency or "INR",
+    )
+    result = _authorize_internal(auth_payload, db)
+    task.transaction_id = result.transaction_id
+    db.commit()
+
+    # Single-use: the task machinery authorizes exactly one engine call.
+    if task.delegation_id or task.task_agent_id:
+        _revoke_task_authority(db, task, "single-use task authority consumed")
+        task = db.query(models.Task).filter(models.Task.id == task_id).first()
+
+    status, needs_approval = _map_task_outcome(result.authorization_status, result.risk_level)
+    task.status = status
+    db.commit()
+
+    approval_resp = None
+    token_plain = None
+    if needs_approval:
+        token_plain = secrets.token_urlsafe(32)
+        approval_id = _gen_approval_id()
+        while db.query(models.Approval).filter(models.Approval.id == approval_id).first():
+            approval_id = _gen_approval_id()
+        approval = models.Approval(
+            id=approval_id,
+            task_id=task.id,
+            transaction_id=task.transaction_id,
+            amount=float(payload.requested_amount),
+            reason=result.reason,
+            risk_level=result.risk_level,
+            token_hash=_hash_approval_token(token_plain),
+            status="PENDING",
+            created_at=now,
+            expires_at=task.expires_at,
+        )
+        db.add(approval)
+        db.commit()
+        db.refresh(approval)
+        _record_provenance(
+            db,
+            event_type="APPROVAL_REQUESTED",
+            actor_agent_id=agent.id,
+            mandate_id=mandate.id if mandate else None,
+            delegation_id=None,
+            transaction_id=task.transaction_id,
+            decision="VERIFY",
+            reason=result.reason,
+            event_data={"task_id": task.id, "approval_id": approval.id, "amount": float(payload.requested_amount)},
+        )
+        approval_resp = schemas.ApprovalResponse.model_validate(approval)
+
+    return schemas.TaskAuthorizeResponse(
+        task=_task_to_response(db, task), approval=approval_resp, approval_token=token_plain
+    )
+
+
+def _handle_idempotent_task_authorize(
+    payload: schemas.TaskAuthorizeRequest,
+    db: Session,
+    header_key: str | None = None,
+    client_host: str | None = None,
+) -> schemas.TaskAuthorizeResponse:
+    key = (header_key.strip() if header_key and header_key.strip() else None) or (
+        payload.idempotency_key.strip() if payload.idempotency_key and payload.idempotency_key.strip() else None
+    )
+    if key == "":
+        key = None
+    request_hash = None
+    if key:
+        request_hash = _compute_task_request_hash(payload)
+        existing = db.query(models.IdempotencyRecord).filter(models.IdempotencyRecord.key == key).first()
+        if existing:
+            if existing.request_hash == request_hash:
+                logger.info(f"Idempotency replay key={key} task -> returning cached")
+                try:
+                    cached = json.loads(existing.response)
+                    return schemas.TaskAuthorizeResponse(**cached)
+                except Exception:
+                    pass
+            else:
+                raise HTTPException(status_code=409, detail="Idempotency key conflict: same key with different request payload. Use a different key or repeat the exact same request.")
+
+    _check_rate_limit(payload.domain_agent_id, client_host)
+    result = _execute_task_authorize(payload, db)
+
+    if key and request_hash:
+        try:
+            response_json = json.dumps(
+                result.model_dump() if hasattr(result, "model_dump") else result.dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            record = models.IdempotencyRecord(
+                key=key,
+                request_hash=request_hash,
+                response=response_json,
+                transaction_id=result.task.transaction_id,
+            )
+            db.add(record)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            existing = db.query(models.IdempotencyRecord).filter(models.IdempotencyRecord.key == key).first()
+            if existing and existing.request_hash == request_hash:
+                try:
+                    cached = json.loads(existing.response)
+                    return schemas.TaskAuthorizeResponse(**cached)
+                except Exception:
+                    pass
+            logger.warning(f"Failed to store idempotency key {key}: {e}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Seed data — Phase 5 adds provenance events for each seed entity
 # ---------------------------------------------------------------------------
 def seed_data():
@@ -485,11 +904,15 @@ def seed_data():
             return
         print("[seed] Creating demo data...")
         now = datetime.now(timezone.utc)
+        # Domains follow seeded mandate semantics (not agent names):
+        # shopping-agent holds the Grocery mandate -> FOOD; travel-agent holds
+        # the Airlines mandate -> TRAVEL; payment-agent is internal machinery.
         shopping = models.Agent(
             id="shopping-agent",
             name="Shopping Agent",
             description="Handles grocery purchases up to INR 2,000",
             status="ACTIVE",
+            domain="FOOD",
             created_at=now - timedelta(days=2),
         )
         travel = models.Agent(
@@ -497,6 +920,7 @@ def seed_data():
             name="Travel Agent",
             description="Corporate travel booking",
             status="ACTIVE",
+            domain="TRAVEL",
             created_at=now - timedelta(days=5),
         )
         payment = models.Agent(
@@ -504,6 +928,7 @@ def seed_data():
             name="Payment Agent",
             description="Sub-delegated executor for Shopping Agent, Grocery only",
             status="ACTIVE",
+            domain="OTHER",
             created_at=now - timedelta(days=1, hours=2),
         )
         db.add_all([shopping, travel, payment])
@@ -681,6 +1106,13 @@ def seed_data():
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    # Additive upgrades for pre-Phase-2 databases (new columns, backfill).
+    try:
+        from backend.database import ensure_schema_upgrades
+
+        ensure_schema_upgrades(engine)
+    except Exception as e:
+        logger.warning(f"Schema upgrade skipped: {e}")
     seed_data()
 
 
@@ -837,6 +1269,11 @@ def update_agent(agent_id: str, payload: dict, db: Session = Depends(get_db)):
         agent.name = payload["name"]
     if "description" in payload:
         agent.description = payload["description"]
+    if "domain" in payload:
+        norm = str(payload["domain"]).strip().upper() if payload["domain"] else "OTHER"
+        if norm not in ("FOOD", "TRAVEL", "SHOPPING", "OTHER"):
+            raise HTTPException(status_code=400, detail="Invalid domain")
+        agent.domain = norm
     db.commit()
     db.refresh(agent)
     if payload.get("status") == "REVOKED" and was_status != "REVOKED":
@@ -1205,3 +1642,386 @@ def authorize_alias_api(payload: schemas.AuthorizeRequest, db: Session = Depends
     except:
         pass
     return _handle_idempotent_authorize(payload, db, idempotency_key, client_host)
+
+
+# ---------------------------------------------------------------------------
+# Tasks + Approvals — Phase 2 routes
+# ---------------------------------------------------------------------------
+def _client_host(request: Request | None) -> str | None:
+    try:
+        if request and hasattr(request, "client") and request.client:
+            return request.client.host
+    except Exception:
+        pass
+    return None
+
+
+@app.post("/tasks/authorize", response_model=schemas.TaskAuthorizeResponse)
+def task_authorize(
+    payload: schemas.TaskAuthorizeRequest,
+    db: Session = Depends(get_db),
+    request: Request = None,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    return _handle_idempotent_task_authorize(payload, db, idempotency_key, _client_host(request))
+
+
+@app.post("/api/tasks/authorize", response_model=schemas.TaskAuthorizeResponse)
+def task_authorize_api(
+    payload: schemas.TaskAuthorizeRequest,
+    db: Session = Depends(get_db),
+    request: Request = None,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    return _handle_idempotent_task_authorize(payload, db, idempotency_key, _client_host(request))
+
+
+@app.get("/tasks", response_model=list[schemas.TaskResponse])
+def list_tasks(status: str | None = None, db: Session = Depends(get_db)):
+    if status is not None and status not in schemas.VALID_TASK_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status {status}")
+    q = db.query(models.Task).order_by(models.Task.created_at.desc())
+    if status:
+        q = q.filter(models.Task.status == status)
+    tasks = q.limit(100).all()
+    return [_task_to_response(db, t) for t in tasks]
+
+
+@app.get("/api/tasks", response_model=list[schemas.TaskResponse])
+def list_tasks_api(status: str | None = None, db: Session = Depends(get_db)):
+    return list_tasks(status, db)
+
+
+@app.get("/tasks/{task_id}", response_model=schemas.TaskResponse)
+def get_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_to_response(db, task)
+
+
+@app.get("/api/tasks/{task_id}", response_model=schemas.TaskResponse)
+def get_task_api(task_id: str, db: Session = Depends(get_db)):
+    return get_task(task_id, db)
+
+
+@app.post("/tasks/{task_id}/cancel", response_model=schemas.TaskResponse)
+def cancel_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in ("CANCELLED", "EXPIRED"):
+        return _task_to_response(db, task)
+    if task.status in ("APPROVED", "COMPLETED"):
+        raise HTTPException(status_code=409, detail="Task is already approved — there is no pending execution to cancel")
+    task.status = "CANCELLED"
+    _revoke_task_authority(db, task, "task cancelled by user")
+    approval = db.query(models.Approval).filter(models.Approval.task_id == task.id).first()
+    if approval is not None and approval.status == "PENDING":
+        approval.status = "EXPIRED"
+    _record_provenance(
+        db,
+        event_type="TASK_CANCELLED",
+        actor_agent_id=task.domain_agent_id,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        reason="Task cancelled — temporary authority revoked, pending approval invalidated, history preserved",
+        event_data={"task_id": task.id},
+    )
+    db.commit()
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    return _task_to_response(db, task)
+
+
+@app.post("/api/tasks/{task_id}/cancel", response_model=schemas.TaskResponse)
+def cancel_task_api(task_id: str, db: Session = Depends(get_db)):
+    return cancel_task(task_id, db)
+
+
+@app.get("/approvals", response_model=list[schemas.ApprovalResponse])
+def list_approvals(status: str | None = None, task_id: str | None = None, db: Session = Depends(get_db)):
+    if status is not None and status not in schemas.VALID_APPROVAL_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status {status}")
+    q = db.query(models.Approval).order_by(models.Approval.created_at.desc())
+    if status:
+        q = q.filter(models.Approval.status == status)
+    if task_id:
+        q = q.filter(models.Approval.task_id == task_id)
+    return q.limit(100).all()
+
+
+@app.get("/api/approvals", response_model=list[schemas.ApprovalResponse])
+def list_approvals_api(status: str | None = None, task_id: str | None = None, db: Session = Depends(get_db)):
+    return list_approvals(status, task_id, db)
+
+
+@app.post("/approvals/{approval_id}/resolve", response_model=schemas.ApprovalResponse)
+def resolve_approval(approval_id: str, payload: schemas.ApprovalResolveRequest, db: Session = Depends(get_db)):
+    approval = db.query(models.Approval).filter(models.Approval.id == approval_id).first()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    # Token first: no token, no information about state.
+    if not hmac.compare_digest(approval.token_hash, _hash_approval_token(payload.token)):
+        raise HTTPException(status_code=403, detail="Invalid approval token")
+    if approval.status != "PENDING":
+        raise HTTPException(status_code=409, detail=f"Approval already {approval.status} — tokens are single-use")
+    now = datetime.now(timezone.utc)
+    task = db.query(models.Task).filter(models.Task.id == approval.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task for approval not found")
+    # Expiry enforcement (backend-side, never frontend timers).
+    approval_exp = approval.expires_at
+    if approval_exp and approval_exp.tzinfo is None:
+        approval_exp = approval_exp.replace(tzinfo=timezone.utc)
+    if (approval_exp and now > approval_exp) or _task_is_expired(task, now):
+        _expire_task_and_approval(db, task, approval, "approval or task expired before resolution")
+        raise HTTPException(status_code=410, detail="Approval expired")
+    if task.status != "NEEDS_REVIEW":
+        raise HTTPException(status_code=409, detail=f"Task is {task.status} — approval no longer applies")
+    agent = db.query(models.Agent).filter(models.Agent.id == task.domain_agent_id).first()
+    if not agent or agent.status != "ACTIVE":
+        raise HTTPException(status_code=409, detail="Domain agent is not active — approval cannot proceed")
+    # Scope binding: this token authorizes exactly this task and amount.
+    if approval.task_id != task.id or float(approval.amount) != float(task.requested_amount):
+        raise HTTPException(status_code=409, detail="Approval does not match this task")
+    if payload.action == "deny":
+        approval.status = "DENIED"
+        approval.resolved_at = now
+        task.status = "CANCELLED"
+        _revoke_task_authority(db, task, "task denied by user")
+        _record_provenance(
+            db,
+            event_type="APPROVAL_DENIED",
+            actor_agent_id=task.domain_agent_id,
+            delegation_id=task.delegation_id,
+            transaction_id=task.transaction_id,
+            reason="User denied the one-time request — standing rule unchanged",
+            event_data={"task_id": task.id, "approval_id": approval.id},
+        )
+        db.commit()
+        return approval
+    # Approve once: flips ONLY this task. The standing mandate is never touched.
+    approval.status = "APPROVED"
+    approval.resolved_at = now
+    task.status = "APPROVED"
+    _record_provenance(
+        db,
+        event_type="APPROVAL_GRANTED",
+        actor_agent_id=task.domain_agent_id,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        decision="ALLOW",
+        reason="One-time user approval — standing rule unchanged",
+        event_data={
+            "task_id": task.id,
+            "approval_id": approval.id,
+            "amount": float(approval.amount),
+            "merchant": task.merchant,
+            "one_time": True,
+        },
+    )
+    db.commit()
+    db.refresh(approval)
+    return approval
+
+
+@app.post("/api/approvals/{approval_id}/resolve", response_model=schemas.ApprovalResponse)
+def resolve_approval_api(approval_id: str, payload: schemas.ApprovalResolveRequest, db: Session = Depends(get_db)):
+    return resolve_approval(approval_id, payload, db)
+
+
+# ---------------------------------------------------------------------------
+# Mock payments — Phase 3 (simulated execution for APPROVED tasks only)
+#
+# Demo harness: no funds move. The UI can never mark a payment successful —
+# only these endpoints transition payment status, and only for tasks the
+# engine (or a one-time approval) approved. Amount/merchant are snapshotted
+# server-side from the task; the client supplies task_id + method + note.
+#
+# Provenance uses MOCK_PAYMENT_* event types deliberately: the existing
+# PAYMENT_COMPLETED means "authorization decision recorded" and reusing it
+# for simulated success would conflate the two in the audit log.
+# ---------------------------------------------------------------------------
+def _payment_to_response(payment: models.MockPayment) -> schemas.MockPaymentResponse:
+    return schemas.MockPaymentResponse.model_validate(payment)
+
+
+def _validate_task_for_payment(db: Session, task: models.Task) -> models.Agent:
+    """Gate shared by create + execute. Returns the domain agent if this task
+    may proceed to (simulated) payment, else raises. Re-validated at execute
+    time so cancel/revoke/expiry between create and execute cannot slip by."""
+    if task.status != "APPROVED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is {task.status} — only APPROVED tasks can proceed to payment",
+        )
+    now = datetime.now(timezone.utc)
+    if _task_is_expired(task, now):
+        approval = db.query(models.Approval).filter(models.Approval.task_id == task.id).first()
+        _expire_task_and_approval(db, task, approval, "task expired before payment")
+        raise HTTPException(status_code=410, detail="Task expired")
+    agent = db.query(models.Agent).filter(models.Agent.id == task.domain_agent_id).first()
+    if not agent or agent.status != "ACTIVE":
+        raise HTTPException(status_code=409, detail="Domain agent is not active — payment unavailable")
+    return agent
+
+
+@app.post("/mock-payments/create", response_model=schemas.MockPaymentResponse, status_code=201)
+def create_mock_payment(
+    payload: schemas.MockPaymentCreate,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    task = db.query(models.Task).filter(models.Task.id == payload.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    agent = _validate_task_for_payment(db, task)
+    _check_rate_limit(agent.id, _client_host(request))
+    existing = db.query(models.MockPayment).filter(models.MockPayment.task_id == task.id).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="A payment already exists for this task — duplicates are rejected")
+    payment_id = _gen_payment_id()
+    while db.query(models.MockPayment).filter(models.MockPayment.id == payment_id).first():
+        payment_id = _gen_payment_id()
+    payment = models.MockPayment(
+        id=payment_id,
+        task_id=task.id,
+        transaction_id=task.transaction_id,
+        merchant=task.merchant,
+        amount=float(task.requested_amount),
+        currency="INR",
+        status="CREATED",
+        payment_method=payload.payment_method,
+        note=(payload.note or "").strip() or None,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(payment)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Lost a race with a concurrent create: the unique task_id guard won.
+        raise HTTPException(status_code=409, detail="A payment already exists for this task — duplicates are rejected")
+    db.refresh(payment)
+    _record_provenance(
+        db,
+        event_type="MOCK_PAYMENT_CREATED",
+        actor_agent_id=task.domain_agent_id,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        reason=f"Demo payment created: ₹{payment.amount:,.0f} to {payment.merchant} — no real funds transferred",
+        event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
+    )
+    return _payment_to_response(payment)
+
+
+@app.post("/api/mock-payments/create", response_model=schemas.MockPaymentResponse, status_code=201)
+def create_mock_payment_api(
+    payload: schemas.MockPaymentCreate, db: Session = Depends(get_db), request: Request = None
+):
+    return create_mock_payment(payload, db, request)
+
+
+@app.post("/mock-payments/{payment_id}/execute", response_model=schemas.MockPaymentResponse)
+def execute_mock_payment(
+    payment_id: str,
+    payload: schemas.MockPaymentExecute,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    payment = db.query(models.MockPayment).filter(models.MockPayment.id == payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment.status not in ("CREATED", "FAILED"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Payment is {payment.status} — only new or failed payments can execute",
+        )
+    task = db.query(models.Task).filter(models.Task.id == payment.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task for payment not found")
+    agent = _validate_task_for_payment(db, task)
+    _check_rate_limit(agent.id, _client_host(request))
+    # Binding: the payment must still match its task exactly (tamper → reject).
+    if float(payment.amount) != float(task.requested_amount) or payment.merchant != task.merchant:
+        raise HTTPException(status_code=409, detail="Payment does not match its task")
+    payment.status = "PROCESSING"
+    payment.failure_reason = None
+    db.commit()
+    _record_provenance(
+        db,
+        event_type="MOCK_PAYMENT_PROCESSING",
+        actor_agent_id=task.domain_agent_id,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        reason=f"Demo payment processing: ₹{payment.amount:,.0f} to {payment.merchant}",
+        event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
+    )
+    if payload.simulate_failure:
+        payment.status = "FAILED"
+        payment.failure_reason = "Simulated failure (demo harness)"
+        payment.completed_at = None
+        db.commit()
+        _record_provenance(
+            db,
+            event_type="MOCK_PAYMENT_FAILED",
+            actor_agent_id=task.domain_agent_id,
+            delegation_id=task.delegation_id,
+            transaction_id=task.transaction_id,
+            reason="Demo payment failed (simulated) — task stays approved, retry is allowed",
+            event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
+        )
+        db.refresh(payment)
+        return _payment_to_response(payment)
+    payment.status = "SUCCEEDED"
+    payment.completed_at = datetime.now(timezone.utc)
+    task.status = "COMPLETED"
+    db.commit()
+    _record_provenance(
+        db,
+        event_type="MOCK_PAYMENT_SUCCEEDED",
+        actor_agent_id=task.domain_agent_id,
+        delegation_id=task.delegation_id,
+        transaction_id=task.transaction_id,
+        reason=f"Demo payment succeeded: ₹{payment.amount:,.0f} to {payment.merchant} — simulated, no real funds transferred",
+        event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
+    )
+    db.refresh(payment)
+    return _payment_to_response(payment)
+
+
+@app.post("/api/mock-payments/{payment_id}/execute", response_model=schemas.MockPaymentResponse)
+def execute_mock_payment_api(
+    payment_id: str, payload: schemas.MockPaymentExecute, db: Session = Depends(get_db), request: Request = None
+):
+    return execute_mock_payment(payment_id, payload, db, request)
+
+
+@app.get("/mock-payments/{payment_id}", response_model=schemas.MockPaymentResponse)
+def get_mock_payment(payment_id: str, db: Session = Depends(get_db)):
+    payment = db.query(models.MockPayment).filter(models.MockPayment.id == payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return _payment_to_response(payment)
+
+
+@app.get("/api/mock-payments/{payment_id}", response_model=schemas.MockPaymentResponse)
+def get_mock_payment_api(payment_id: str, db: Session = Depends(get_db)):
+    return get_mock_payment(payment_id, db)
+
+
+@app.get("/mock-payments", response_model=list[schemas.MockPaymentResponse])
+def list_mock_payments(task_id: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    if status is not None and status not in schemas.VALID_MOCK_PAYMENT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status {status}")
+    q = db.query(models.MockPayment).order_by(models.MockPayment.created_at.desc())
+    if task_id:
+        q = q.filter(models.MockPayment.task_id == task_id)
+    if status:
+        q = q.filter(models.MockPayment.status == status)
+    return q.limit(100).all()
+
+
+@app.get("/api/mock-payments", response_model=list[schemas.MockPaymentResponse])
+def list_mock_payments_api(task_id: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    return list_mock_payments(task_id, status, db)

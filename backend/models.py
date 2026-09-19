@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, DateTime, ForeignKey, Text, Integer
+from sqlalchemy import Column, String, Float, DateTime, ForeignKey, Text, Integer, Boolean
 from sqlalchemy.sql import func
 from backend.database import Base
 import uuid
@@ -9,6 +9,12 @@ def gen_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
+# Explicit user-facing domains. Stored on the agent so domain resolution never
+# has to guess from names/purposes/categories (Phase 1 inference is retired).
+# OTHER = unclassified or internal machinery (e.g. delegated executors).
+VALID_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "OTHER")
+
+
 class Agent(Base):
     __tablename__ = "agents"
 
@@ -16,6 +22,8 @@ class Agent(Base):
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     status = Column(String, nullable=False, default="ACTIVE")  # ACTIVE | REVOKED
+    domain = Column(String, nullable=False, default="OTHER")  # FOOD | TRAVEL | SHOPPING | OTHER
+    is_task_agent = Column(Boolean, nullable=False, default=False)  # True = ephemeral task machinery, hidden from user agent lists
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -97,3 +105,80 @@ class IdempotencyRecord(Base):
     response = Column(Text, nullable=False)  # JSON of AuthorizeResponse
     transaction_id = Column(String, ForeignKey("transactions.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Task(Base):
+    """Phase 2 — one user request handled by a persistent domain agent.
+
+    A task never grants authority by itself: the task_limit is enforced to be
+    within the domain agent's effective authority at creation, and any payment
+    still goes through the standard authorization + risk engine. COMPLETED is
+    reserved for a future execution phase and is never written in Phase 2
+    (there is no external payment execution yet).
+    """
+
+    __tablename__ = "tasks"
+
+    id = Column(String, primary_key=True, index=True)  # task-xxx
+    domain_agent_id = Column(String, ForeignKey("agents.id"), nullable=False, index=True)
+    task_agent_id = Column(String, ForeignKey("agents.id"), nullable=True, index=True)
+    purpose = Column(String, nullable=False)
+    requested_amount = Column(Float, nullable=False)
+    task_limit = Column(Float, nullable=False)  # <= domain agent effective authority
+    category = Column(String, nullable=False)
+    merchant = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="PENDING")  # PENDING | APPROVED | NEEDS_REVIEW | COMPLETED | CANCELLED | EXPIRED
+    delegation_id = Column(String, ForeignKey("delegations.id"), nullable=True, index=True)
+    transaction_id = Column(String, ForeignKey("transactions.id"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class Approval(Base):
+    """Phase 2 — one-time user decision for a NEEDS_REVIEW task.
+
+    The token is single-use, scope-bound (exact task + amount), and expiring.
+    Resolving an approval NEVER modifies the standing mandate — it only
+    flips this task's outcome. Only the SHA256 hash is stored; the plaintext
+    token is returned exactly once at creation.
+    """
+
+    __tablename__ = "approvals"
+
+    id = Column(String, primary_key=True, index=True)  # apr-xxx
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, unique=True, index=True)
+    transaction_id = Column(String, ForeignKey("transactions.id"), nullable=True, index=True)
+    amount = Column(Float, nullable=False)
+    reason = Column(Text, nullable=False)
+    risk_level = Column(String, nullable=True)
+    token_hash = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="PENDING")  # PENDING | APPROVED | DENIED | EXPIRED
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class MockPayment(Base):
+    """Phase 3 — simulated payment execution for an APPROVED task.
+
+    Demo harness only: no funds move. One payment row per task (unique
+    task_id) so duplicates are impossible at the DB level. Execution is
+    gated on the task being APPROVED, fresh, and the domain agent ACTIVE —
+    re-validated at execute time, not just at creation. Amount/merchant are
+    snapshotted server-side from the task; the client can never set them.
+    """
+
+    __tablename__ = "mock_payments"
+
+    id = Column(String, primary_key=True, index=True)  # pay-xxx
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, unique=True, index=True)
+    transaction_id = Column(String, ForeignKey("transactions.id"), nullable=True, index=True)
+    merchant = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    currency = Column(String, nullable=False, default="INR")
+    status = Column(String, nullable=False, default="CREATED")  # CREATED | PROCESSING | SUCCEEDED | FAILED
+    payment_method = Column(String, nullable=False, default="Demo Balance")
+    note = Column(Text, nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)

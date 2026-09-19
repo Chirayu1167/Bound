@@ -61,3 +61,44 @@ def init_db():
             conn.execute(__import__("sqlalchemy").text("PRAGMA foreign_keys=ON"))
     except Exception as e:
         logger.warning(f"Failed to verify FK pragma: {e}")
+
+
+def ensure_schema_upgrades(bind_engine=None):
+    """Additive upgrades for databases created before Phase 2.
+
+    - Adds agents.domain / agents.is_task_agent when missing (existing rows
+      keep working; new columns default to OTHER / false).
+    - Backfills domains for the well-known seed agents ONLY at the moment the
+      column is first added (never overwrites user edits on later startups).
+      Classification follows seeded mandate semantics, not agent names:
+      shopping-agent holds the Grocery mandate -> FOOD, travel-agent holds
+      the Airlines mandate -> TRAVEL, everything else stays OTHER.
+    - New tables (tasks, approvals) are created by create_all; this only
+      handles the ALTER TABLE part that create_all cannot do.
+    Idempotent and safe to call on every startup.
+    """
+    from sqlalchemy import text as _text
+
+    eng = bind_engine or engine
+    try:
+        with eng.connect() as conn:
+            cols = [row[1] for row in conn.execute(_text("PRAGMA table_info(agents)")).fetchall()]
+            added_domain = False
+            if "domain" not in cols:
+                conn.execute(_text("ALTER TABLE agents ADD COLUMN domain VARCHAR DEFAULT 'OTHER'"))
+                added_domain = True
+            if "is_task_agent" not in cols:
+                conn.execute(_text("ALTER TABLE agents ADD COLUMN is_task_agent BOOLEAN DEFAULT 0"))
+            conn.commit()
+            if added_domain:
+                # One-time backfill for pre-existing seed rows only.
+                conn.execute(
+                    _text("UPDATE agents SET domain='FOOD' WHERE id='shopping-agent' AND (domain IS NULL OR domain='OTHER')")
+                )
+                conn.execute(
+                    _text("UPDATE agents SET domain='TRAVEL' WHERE id='travel-agent' AND (domain IS NULL OR domain='OTHER')")
+                )
+                conn.commit()
+                logger.info("Backfilled agent domains for seed agents (FOOD/TRAVEL).")
+    except Exception as e:
+        logger.warning(f"Schema upgrade check failed (non-fatal): {e}")
