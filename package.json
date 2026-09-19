@@ -1,0 +1,27 @@
+{
+  "name": "bound",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bound — Agent Payment Security. Cryptographically enforced permission contracts and zero-latency enclave authorization for AI agents.",
+  "scripts": {
+    "dev": "vite --port 3000 --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --port 3000",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.12",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.5.2",
+    "tailwindcss": "^4.1.12",
+    "typescript": "^5.8.2",
+    "vite": "^6.3.5"
+  }
+}
