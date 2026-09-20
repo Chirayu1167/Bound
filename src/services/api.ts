@@ -7,13 +7,32 @@
  *  delegations:  id, parent_agent_id, child_agent_id, parent_mandate_id, delegated_amount_limit, purpose, merchant_category, status, created_at, expires_at
  *  transactions: id, agent_id, mandate_id, delegation_id, amount, currency, merchant, merchant_category, purpose, decision, reason, created_at
  *
- * VITE_API_URL controls the base. Falls back to http://localhost:4000 for local dev.
+ * VITE_API_URL controls the base. In local development (page served from
+ * localhost) it falls back to http://localhost:4000. In production it must
+ * be baked in at build time — there is intentionally no localhost fallback,
+ * so a missing VITE_API_URL fails loudly instead of silently hitting localhost.
  */
 
 import type { AgentNode, MandateItem, TransactionRecord, DelegationItem, DelegationChain, ProvenanceEvent, ProvenanceVerifyResult, TaskItem, ApprovalItem, MockPaymentItem } from '../types';
 
-const RAW_URL = (import.meta.env.VITE_API_URL as string | undefined) || '';
-export const API_URL = RAW_URL.replace(/\/+$/, '') || 'http://localhost:4000';
+const RAW_URL = ((import.meta.env.VITE_API_URL as string | undefined) || '').trim();
+
+function resolveApiUrl(): string {
+  const cleaned = RAW_URL.replace(/\/+$/, '');
+  if (cleaned) return cleaned;
+  // Local-dev fallback only when the page itself runs on localhost.
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '' || host.endsWith('.localhost')) {
+      return 'http://localhost:4000';
+    }
+    console.error('[api] VITE_API_URL is not configured — rebuild with VITE_API_URL set to the public backend URL.');
+    return '';
+  }
+  return 'http://localhost:4000';
+}
+
+export const API_URL = resolveApiUrl();
 const BASE = API_URL;
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -259,8 +278,12 @@ export async function getTransactions(): Promise<TransactionRecord[]> {
 
 export async function healthCheck(): Promise<{ ok: boolean; mode: 'mock' | 'live' }> {
   try {
-    const res = await apiFetch<{ status: string }>('/health');
-    return { ok: res.status === 'ok', mode: 'live' };
+    const res = await apiFetch<{ status?: unknown }>('/health');
+    // HTTP 200 alone is not enough — validate the health payload.
+    // Accept case/whitespace variants of {"status":"ok"}; anything else is Offline.
+    const status = String(res?.status ?? '').trim().toLowerCase();
+    const ok = status === 'ok';
+    return { ok, mode: 'live' };
   } catch {
     return { ok: false, mode: 'mock' };
   }

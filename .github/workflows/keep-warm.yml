@@ -1,0 +1,34 @@
+# Keep the Render free-tier backend warm.
+#
+# Render free web services sleep after ~15 min without inbound traffic —
+# Render's `healthCheckPath` only gates deploys, it does NOT keep a service
+# awake, and in-process timers (e.g. node-cron) do not count as traffic.
+# This workflow pings GET /health every 10 minutes so idle sleep never kicks
+# in. It is the same class of solution teams use when they say a Render
+# backend "runs forever" on the free plan (external ping < idle timeout).
+#
+# URL defaults to the Bound production API. Override without editing this
+# file by setting a repository Variable (Settings → Variables → Actions):
+#   BOUND_API_URL = https://your-backend.onrender.com
+# Manual runs: Actions tab → "Keep Render backend warm" → Run workflow.
+
+name: Keep Render backend warm
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /health
+        env:
+          BACKEND_URL: ${{ vars.BOUND_API_URL }}
+        run: |
+          URL="${BACKEND_URL:-https://bound-api-xhbd.onrender.com}"
+          URL="${URL%/}/health"
+          echo "Pinging $URL"
+          curl -fsS --max-time 90 "$URL" -o /dev/null -w "HTTP %{http_code}\n"

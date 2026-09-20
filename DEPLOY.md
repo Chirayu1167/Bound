@@ -35,5 +35,34 @@ VITE_API_URL=https://bound-api.example.com npm run build
 ```
 
 Serve the resulting `dist/` directory with any static host. If `VITE_API_URL`
-is unset the build falls back to `http://localhost:4000`, which is only
-correct for local development (`npm run dev` + `.env`).
+is unset the app uses `http://localhost:4000` only when the page itself is
+served from localhost; on any other host it fails loudly (and logs an error)
+instead of silently hitting localhost — so production must always bake in
+`VITE_API_URL`.
+
+## Keeping the Render free-tier backend warm
+
+Render free web services sleep after ~15 minutes without inbound traffic.
+The first request after sleep takes ~25–30s (we measured ~26s on
+`/health`), which is what used to latch the frontend's "Backend offline"
+banner. Notes from comparing with the PrepHire-AI setup:
+
+- PrepHire's `render.yaml` sets `healthCheckPath: /api/health`, but that
+  only gates deploy health — it does **not** keep a free service awake.
+- PrepHire's `node-cron` midnight cleanup is an in-process timer, which also
+  does **not** count as inbound traffic, so it does not prevent sleep.
+- A backend "runs forever" on Render free only via inbound traffic every
+  <15 min (external pinger) or a paid (Starter+) plan that doesn't sleep.
+
+Bound now covers both sides:
+
+1. **Idle (no users):** `.github/workflows/keep-warm.yml` pings
+   `GET /health` every 10 minutes (plus manual "Run workflow"). No secret
+   needed — it defaults to `https://bound-api-xhbd.onrender.com`; override
+   via an Actions repository Variable `BOUND_API_URL`. Alternatives are
+   UptimeRobot / cron-job.org on the same endpoint, or upgrading Render to
+   Starter.
+2. **In session (user has the tab open):** the frontend runs health + data
+   fetches in parallel on load and retries `/health` every 10s (up to 10×)
+   when offline, so a cold-starting backend self-heals to Online without a
+   reload. See `src/App.tsx` / `src/services/api.ts`.

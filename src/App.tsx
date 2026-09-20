@@ -48,7 +48,7 @@ export default function App() {
     }, 3500);
   };
 
-  const refreshData = useCallback(async () => {
+  const refreshData = useCallback(async (): Promise<boolean> => {
     try {
       const [a, m, t, d, tk, ap, pay] = await Promise.all([
         api.getAgents(),
@@ -66,9 +66,14 @@ export default function App() {
       setTasks(tk);
       setApprovals(ap);
       setPayments(pay);
+      // Core live endpoints succeeded, so the backend is demonstrably reachable.
+      // This corrects a stale Offline latch from an earlier cold-start health probe.
+      setBackendLive(true);
+      return true;
     } catch (e) {
       console.error('[App] refresh failed', e);
       showToast('Could not load data from the backend.');
+      return false;
     }
   }, []);
 
@@ -107,15 +112,46 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
+    let interval: ReturnType<typeof setInterval> | undefined;
     (async () => {
       setLoading(true);
-      const health = await api.healthCheck().catch(() => ({ ok: false, mode: 'mock' as const }));
-      if (mounted) setBackendLive(health.ok && health.mode === 'live');
-      await refreshData();
-      if (mounted) setLoading(false);
+      // Run health + data in parallel: on Render the backend cold-starts, so a
+      // sequential single-shot health probe can fail (503) while the later data
+      // fetch succeeds after wake-up. Deriving Online from either success avoids
+      // latching a false Offline when real data is on screen.
+      const [health, dataOk] = await Promise.all([
+        api.healthCheck().catch(() => ({ ok: false, mode: 'mock' as const })),
+        refreshData(),
+      ]);
+      if (!mounted) return;
+      const healthOk = health.ok && health.mode === 'live';
+      setBackendLive(dataOk || healthOk);
+      setLoading(false);
+      // If still offline (backend was waking), re-probe until it answers.
+      // Stops on first success (which also reloads data) or after 10 tries.
+      if (!dataOk && !healthOk) {
+        let attempts = 0;
+        interval = setInterval(async () => {
+          attempts += 1;
+          const retry = await api.healthCheck().catch(() => ({ ok: false, mode: 'mock' as const }));
+          const live = retry.ok && retry.mode === 'live';
+          if (!mounted) {
+            if (interval) clearInterval(interval);
+            return;
+          }
+          if (live) {
+            setBackendLive(true);
+            if (interval) clearInterval(interval);
+            await refreshData();
+          } else if (attempts >= 10) {
+            if (interval) clearInterval(interval);
+          }
+        }, 10000);
+      }
     })();
     return () => {
       mounted = false;
+      if (interval) clearInterval(interval);
     };
   }, [refreshData]);
 
@@ -424,7 +460,9 @@ export default function App() {
             selected={selectedTx}
             onSelect={setSelectedTx}
             onAuthorize={handleAuthorize}
-            onRefresh={refreshData}
+            onRefresh={async () => {
+              await refreshData();
+            }}
           />
         )}
 
