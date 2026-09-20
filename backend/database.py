@@ -89,6 +89,15 @@ def ensure_schema_upgrades(bind_engine=None):
                 added_domain = True
             if "is_task_agent" not in cols:
                 conn.execute(_text("ALTER TABLE agents ADD COLUMN is_task_agent BOOLEAN DEFAULT 0"))
+            # Final-amount support: charge recorded at execution, validated
+            # against the task ceiling. Absent columns read as NULL (unknown).
+            tables = [row[0] for row in conn.execute(_text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()]
+            if "mock_payments" in tables:
+                pay_cols = [row[1] for row in conn.execute(_text("PRAGMA table_info(mock_payments)")).fetchall()]
+                if "actual_amount" not in pay_cols:
+                    conn.execute(_text("ALTER TABLE mock_payments ADD COLUMN actual_amount FLOAT"))
+                if "item_summary" not in pay_cols:
+                    conn.execute(_text("ALTER TABLE mock_payments ADD COLUMN item_summary TEXT"))
             conn.commit()
             if added_domain:
                 # One-time backfill for pre-existing seed rows only.

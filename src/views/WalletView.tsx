@@ -42,8 +42,8 @@ interface WalletViewProps {
   onApprove: (approval: ApprovalItem) => Promise<void>;
   onDeny: (approval: ApprovalItem) => Promise<void>;
   onCancelTask: (task: TaskItem) => Promise<void>;
-  onPayTask: (task: TaskItem, method: string, note: string) => Promise<MockPaymentItem>;
-  onRetryPayment: (payment: MockPaymentItem) => Promise<MockPaymentItem>;
+  onPayTask: (task: TaskItem, method: string, note: string, actual: number, item: string | null) => Promise<MockPaymentItem>;
+  onRetryPayment: (payment: MockPaymentItem, actual: number | null, item: string | null) => Promise<MockPaymentItem>;
   onRevokeAgent: (agentId: string) => Promise<void>;
   onSetupDomain: (domainId: DomainId) => void;
   notify: (msg: string) => void;
@@ -532,11 +532,11 @@ export const WalletView: React.FC<WalletViewProps> = ({
     setPayError(null);
   };
 
-  const handlePay = async (task: TaskItem, method: string, note: string) => {
+  const handlePay = async (task: TaskItem, method: string, note: string, actual: number, item: string | null) => {
     setPayBusy(true);
     setPayError(null);
     try {
-      const result = await onPayTask(task, method, note);
+      const result = await onPayTask(task, method, note, actual, item);
       setPayment(result);
       if (result.status === 'SUCCEEDED') {
         touchSession({ lastPaymentAt: Date.now(), lastTaskStatus: 'COMPLETED' });
@@ -548,13 +548,13 @@ export const WalletView: React.FC<WalletViewProps> = ({
     }
   };
 
-  const handleRetry = async () => {
+  const handleRetry = async (actual: number | null, item: string | null) => {
     const current = payment || (payingTaskId ? paymentByTask.get(payingTaskId) || null : null);
     if (!current) return;
     setPayBusy(true);
     setPayError(null);
     try {
-      const result = await onRetryPayment(current);
+      const result = await onRetryPayment(current, actual, item);
       setPayment(result);
     } catch (e: unknown) {
       setPayError(e instanceof Error ? e.message : 'Retry failed.');
@@ -645,7 +645,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
         payment={activePayment}
         busy={payBusy}
         error={payError}
-        onPay={(method, note) => handlePay(task, method, note)}
+        onPay={(method, note, actual, item) => handlePay(task, method, note, actual, item)}
         onRetry={handleRetry}
         onNewRequest={closePayment}
         onViewActivity={() => onNavigate('activity')}

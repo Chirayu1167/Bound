@@ -34,6 +34,12 @@ export interface MockPaymentItem {
   completed_at: string | null;
   /** Demo-wallet balance after this payment debited; null until SUCCEEDED. */
   wallet_balance_after: number | null;
+  /** Final amount actually charged; null until execution resolves it. */
+  actual_amount: number | null;
+  /** Authorization ceiling the charge was validated against. */
+  authorized_amount: number | null;
+  /** User-supplied order summary, if any. */
+  item_summary: string | null;
 }
 
 export interface TaskItem {

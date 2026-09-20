@@ -2042,6 +2042,8 @@ def _payment_to_response(db: Session, payment: models.MockPayment) -> schemas.Mo
         .first()
     )
     resp.wallet_balance_after = float(entry.balance_after) if entry else None
+    task = db.query(models.Task).filter(models.Task.id == payment.task_id).first()
+    resp.authorized_amount = float(task.requested_amount) if task else None
     return resp
 
 
@@ -2142,14 +2144,51 @@ def execute_mock_payment(
     agent = _validate_task_for_payment(db, task)
     _check_rate_limit(agent.id, _client_host(request))
     # Binding: the payment must still match its task exactly (tamper → reject).
+    # payment.amount is the AUTHORIZED snapshot; the final charge is resolved
+    # below and can only be equal or lower — never higher.
     if float(payment.amount) != float(task.requested_amount) or payment.merchant != task.merchant:
         raise HTTPException(status_code=409, detail="Payment does not match its task")
+    ceiling = float(task.requested_amount)
+    actual = float(payload.actual_amount) if payload.actual_amount is not None else float(payment.amount)
+    summary = (payload.item_summary or "").strip() or None
+    # Safety rule (backend-enforced, never frontend): the final charge must
+    # not exceed the authorized ceiling. Over-ceiling attempts fail WITHOUT
+    # debit and WITHOUT completion; the payment stays retryable with a
+    # corrected final amount, and the task stays APPROVED for its ceiling.
+    if actual > ceiling + 1e-9:
+        payment.status = "FAILED"
+        payment.actual_amount = round(actual, 2)
+        payment.item_summary = summary
+        payment.failure_reason = (
+            f"Final order amount ₹{actual:,.0f} exceeds your ₹{ceiling:,.0f} authorization. "
+            f"Nothing was debited and the order is not completed — retry with a final "
+            f"amount at or below ₹{ceiling:,.0f}, or cancel the task."
+        )
+        payment.completed_at = None
+        db.commit()
+        _record_provenance(
+            db,
+            event_type="PAYMENT_REJECTED",
+            actor_agent_id=task.domain_agent_id,
+            delegation_id=task.delegation_id,
+            transaction_id=task.transaction_id,
+            decision="VERIFY",
+            reason=payment.failure_reason,
+            event_data={"task_id": task.id, "payment_id": payment.id,
+                        "authorized_amount": ceiling, "actual_amount": round(actual, 2),
+                        "simulated": True},
+        )
+        db.refresh(payment)
+        return _payment_to_response(db, payment)
     # Wallet gate BEFORE any state change: insufficient funds reject with no
     # debit and no status change (task stays APPROVED, retry after top-up).
-    _wallet_sufficient_or_raise(db, amount=float(payment.amount), merchant=payment.merchant,
+    _wallet_sufficient_or_raise(db, amount=actual, merchant=payment.merchant,
                                 agent_id=task.domain_agent_id, task=task, payment_id=payment.id)
     payment.status = "PROCESSING"
     payment.failure_reason = None
+    payment.actual_amount = round(actual, 2)
+    if summary is not None:
+        payment.item_summary = summary
     db.commit()
     _record_provenance(
         db,
@@ -2157,7 +2196,7 @@ def execute_mock_payment(
         actor_agent_id=task.domain_agent_id,
         delegation_id=task.delegation_id,
         transaction_id=task.transaction_id,
-        reason=f"Demo payment processing: ₹{payment.amount:,.0f} to {payment.merchant}",
+        reason=f"Demo payment processing: ₹{actual:,.0f} to {payment.merchant}",
         event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
     )
     if payload.simulate_failure:
@@ -2176,19 +2215,25 @@ def execute_mock_payment(
         )
         db.refresh(payment)
         return _payment_to_response(db, payment)
+    # The charge IS the final amount — never the ceiling. amount mirrors it so
+    # every reader (orders, activity, audit) sees one consistent number; the
+    # ceiling remains immutable on the task.
+    payment.amount = round(actual, 2)
     payment.status = "SUCCEEDED"
     payment.completed_at = datetime.now(timezone.utc)
     task.status = "COMPLETED"
     # Atomic with the status change above: the debit lands in the same commit,
     # so a completed payment always corresponds to a real wallet debit.
-    _debit_wallet(
+    entry = _debit_wallet(
         db,
-        amount=float(payment.amount),
+        amount=round(actual, 2),
         merchant=payment.merchant,
         agent_id=task.domain_agent_id,
         task=task,
         payment_id=payment.id,
     )
+    if summary is not None:
+        entry.note = summary
     db.commit()
     _record_provenance(
         db,
@@ -2196,8 +2241,9 @@ def execute_mock_payment(
         actor_agent_id=task.domain_agent_id,
         delegation_id=task.delegation_id,
         transaction_id=task.transaction_id,
-        reason=f"Demo payment succeeded: ₹{payment.amount:,.0f} to {payment.merchant} — simulated, no real funds transferred",
-        event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
+        reason=f"Demo payment succeeded: ₹{actual:,.0f} to {payment.merchant} (authorized up to ₹{ceiling:,.0f}) — simulated, no real funds transferred",
+        event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True,
+                    "authorized_amount": ceiling, "actual_amount": round(actual, 2)},
     )
     db.refresh(payment)
     return _payment_to_response(db, payment)

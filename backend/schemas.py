@@ -378,6 +378,37 @@ class MockPaymentExecute(BaseModel):
     # Demo-harness control for exercising the failure path in tests/demos.
     # The UI never sends this; production behavior is always success.
     simulate_failure: bool = Field(False, example=False)
+    # Final order amount actually charged. Optional — defaults to the task's
+    # authorized ceiling. The backend rejects (no debit, no completion) any
+    # value above the ceiling; the frontend must never enforce this itself.
+    actual_amount: Optional[float] = Field(None, example=445)
+    # Short order summary shown on orders/receipts (e.g. "Paneer Biryani + Coke").
+    item_summary: Optional[str] = Field(None, max_length=200, example="Paneer Biryani + Coke")
+
+    @field_validator("actual_amount", mode="before")
+    @classmethod
+    def check_actual_amount(cls, v: Any):
+        if v is None:
+            return None
+        try:
+            amount = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("actual_amount must be a number")
+        if not amount > 0:
+            raise ValueError("actual_amount must be greater than zero")
+        if amount > 10_000_000:
+            raise ValueError("actual_amount is unrealistically large")
+        return round(amount, 2)
+
+    @field_validator("item_summary", mode="before")
+    @classmethod
+    def check_item_summary(cls, v: Any):
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("item_summary must be text")
+        v = v.strip()
+        return v[:200] if v else None
 
 
 class MockPaymentResponse(BaseModel):
@@ -395,6 +426,12 @@ class MockPaymentResponse(BaseModel):
     completed_at: Optional[datetime] = None
     # Demo-wallet balance after this payment debited, None until SUCCEEDED.
     wallet_balance_after: Optional[float] = None
+    # Final amount actually charged (None until execution resolves it).
+    actual_amount: Optional[float] = None
+    # Authorization ceiling this charge was validated against.
+    authorized_amount: Optional[float] = None
+    # User-supplied order summary, if any.
+    item_summary: Optional[str] = None
 
     class Config:
         from_attributes = True

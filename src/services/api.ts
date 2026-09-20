@@ -549,10 +549,19 @@ export async function createMockPayment(taskId: string, paymentMethod = 'Demo Ba
   });
 }
 
-export async function executeMockPayment(paymentId: string, simulateFailure = false): Promise<MockPaymentItem> {
+export async function executeMockPayment(
+  paymentId: string,
+  simulateFailure = false,
+  actualAmount?: number | null,
+  itemSummary?: string | null,
+): Promise<MockPaymentItem> {
   return apiFetch<MockPaymentItem>(`/mock-payments/${encodeURIComponent(paymentId)}/execute`, {
     method: 'POST',
-    body: JSON.stringify({ simulate_failure: simulateFailure }),
+    body: JSON.stringify({
+      simulate_failure: simulateFailure,
+      ...(actualAmount != null ? { actual_amount: actualAmount } : {}),
+      ...(itemSummary ? { item_summary: itemSummary } : {}),
+    }),
   });
 }
 

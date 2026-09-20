@@ -334,11 +334,12 @@ export default function App() {
   };
 
   // Demo payment: create + execute back-to-back. The backend gates both
-  // steps on task APPROVED + fresh + agent ACTIVE; the UI only displays.
-  const handlePayTask = async (task: TaskItem, method: string, note: string) => {
+  // steps on task APPROVED + fresh + agent ACTIVE, validates the final
+  // charge against the task ceiling, and debits the wallet — UI displays.
+  const handlePayTask = async (task: TaskItem, method: string, note: string, actual: number, item: string | null) => {
     try {
       const created = await api.createMockPayment(task.id, method, note);
-      const result = await api.executeMockPayment(created.id);
+      const result = await api.executeMockPayment(created.id, false, actual, item);
       await refreshData();
       showToast(result.status === 'SUCCEEDED' ? 'Payment successful (demo).' : 'Payment failed (demo).');
       return result;
@@ -348,9 +349,9 @@ export default function App() {
     }
   };
 
-  const handleRetryPayment = async (payment: MockPaymentItem) => {
+  const handleRetryPayment = async (payment: MockPaymentItem, actual: number | null, item: string | null) => {
     try {
-      const result = await api.executeMockPayment(payment.id);
+      const result = await api.executeMockPayment(payment.id, false, actual, item);
       await refreshData();
       showToast(result.status === 'SUCCEEDED' ? 'Payment successful (demo).' : 'Payment failed (demo).');
       return result;

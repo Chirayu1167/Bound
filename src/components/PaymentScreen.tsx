@@ -15,8 +15,8 @@ interface PaymentScreenProps {
   payment: MockPaymentItem | null;
   busy: boolean;
   error: string | null;
-  onPay: (method: string, note: string) => void;
-  onRetry: () => void;
+  onPay: (method: string, note: string, actual: number, item: string | null) => void;
+  onRetry: (actual: number | null, item: string | null) => void;
   onNewRequest: () => void;
   onViewActivity: () => void;
   onBack: () => void;
@@ -63,6 +63,12 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
 }) => {
   const [method, setMethod] = useState('Demo Balance');
   const [note, setNote] = useState('');
+  const [finalText, setFinalText] = useState(String(task.requested_amount));
+  const [itemText, setItemText] = useState('');
+
+  const parsedActual = parseFloat(finalText);
+  const actualValid = Number.isFinite(parsedActual) && parsedActual > 0;
+  const actual = actualValid ? Math.round(parsedActual * 100) / 100 : task.requested_amount;
   const [replayBusy, setReplayBusy] = useState(false);
   const [replayMsg, setReplayMsg] = useState<string | null>(null);
 
@@ -80,8 +86,8 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
   const showProcessing = busy || payment?.status === 'PROCESSING' || payment?.status === 'CREATED';
   const succeeded = payment?.status === 'SUCCEEDED';
   const failed = payment?.status === 'FAILED';
-  const balanceAfter = walletBalance != null ? walletBalance - task.requested_amount : null;
-  const wouldOverdraw = walletBalance != null && walletBalance < task.requested_amount;
+  const balanceAfter = walletBalance != null ? walletBalance - actual : null;
+  const wouldOverdraw = walletBalance != null && walletBalance < actual;
   const insufficientHint = error && error.includes('INSUFFICIENT WALLET BALANCE');
 
   const microStage = succeeded || failed ? 3 : showProcessing ? 2 : 0;
@@ -90,7 +96,15 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (busy || payment) return;
-    onPay(method, note.trim());
+    if (!actualValid) {
+      return;
+    }
+    onPay(method, note.trim(), actual, itemText.trim() || null);
+  };
+
+  const retry = () => {
+    if (busy) return;
+    onRetry(actualValid ? actual : null, itemText.trim() || null);
   };
 
   return (
@@ -136,6 +150,10 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           <p className="text-[15px] font-semibold text-[#0b1c30] mt-3">
             ₹{payment.amount.toLocaleString()} sent to {payment.merchant} (demo)
           </p>
+          {payment.item_summary && <p className="text-[13px] text-[#0b1c30] mt-1 break-words">{payment.item_summary}</p>}
+          <p className="text-[12px] text-[#76777d] mt-1">
+            Authorized up to ₹{(payment.authorized_amount ?? task.requested_amount).toLocaleString()} · charged ₹{payment.amount.toLocaleString()}
+          </p>
           <p className="text-[12px] text-[#76777d] mt-1 break-words">
             Ref: {payment.id} · Task {task.id} · {payment.payment_method}
             {payment.completed_at ? ` · ${new Date(payment.completed_at).toLocaleString()}` : ''}
@@ -175,7 +193,7 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           </div>
           {error && <p className="mt-2 text-[13px] text-[#93000a]">{error}</p>}
           <div className="mt-3 flex gap-2">
-            <button onClick={onRetry} disabled={busy} className="px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-60">
+            <button onClick={retry} disabled={busy} className="px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-60">
               {busy ? 'Retrying…' : 'Try again'}
             </button>
             <button onClick={onBack} disabled={busy} className="px-4 py-2 rounded-lg bg-[#eef1f6] text-[#0b1c30] text-[13px] font-medium hover:bg-[#e2e7f0] cursor-pointer disabled:opacity-60">
@@ -186,11 +204,32 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
       ) : (
         <form onSubmit={submit} className="mt-4 space-y-3.5">
           <div className="rounded-lg bg-[#f7f8fb] border border-[#eef0f4] px-4 py-3">
-            <p className="text-[26px] font-semibold text-[#0b1c30]">₹{task.requested_amount.toLocaleString()}</p>
+            <p className="text-[12px] text-[#76777d]">Authorized up to <span className="font-medium text-[#0b1c30]">₹{task.requested_amount.toLocaleString()}</span></p>
             <p className="text-[13px] text-[#0b1c30] mt-0.5 break-words">
               {task.merchant} <span className="text-[#76777d]">· {task.category} · {task.purpose}</span>
             </p>
             <p className="text-[12px] text-[#76777d] mt-0.5">via {agentName}</p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <div>
+              <label className="text-[12px] font-medium text-[#0b1c30] block mb-1">Final amount (₹)</label>
+              <input
+                type="number" min="1" step="any" value={finalText}
+                onChange={(e) => setFinalText(e.target.value)} disabled={busy}
+                aria-label="Final order amount actually charged"
+                className="w-full px-3 py-2 rounded-lg text-[13px] border border-[#c6c6cd] outline-none focus:border-[#0051d5] disabled:opacity-60"
+              />
+              <p className="text-[11px] text-[#76777d] mt-1">Charged, at or below the ₹{task.requested_amount.toLocaleString()} authorization.</p>
+            </div>
+            <div>
+              <label className="text-[12px] font-medium text-[#0b1c30] block mb-1">What&apos;s in the order? (optional)</label>
+              <input
+                value={itemText} onChange={(e) => setItemText(e.target.value)} maxLength={200}
+                placeholder="e.g. Paneer Biryani + Coke" disabled={busy}
+                className="w-full px-3 py-2 rounded-lg text-[13px] border border-[#c6c6cd] outline-none focus:border-[#0051d5] placeholder:text-[#9a9ba1] disabled:opacity-60"
+              />
+            </div>
           </div>
 
           <div className="rounded-lg border border-[#e2e3e8] bg-white px-4 py-3">
@@ -205,7 +244,7 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <dt className="text-[#5a5c63]">Payment</dt>
-                  <dd className="font-medium text-[#0b1c30]">₹{task.requested_amount.toLocaleString()}</dd>
+                  <dd className="font-medium text-[#0b1c30]">₹{actual.toLocaleString()}</dd>
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <dt className="text-[#5a5c63]">Balance after payment</dt>
@@ -260,6 +299,7 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           </div>
 
           {error && <p className="text-[13px] text-[#93000a]">{error}</p>}
+          {!actualValid && <p className="text-[13px] text-[#93000a]">Enter a final amount greater than zero.</p>}
           {insufficientHint && (
             <p className="text-[12px] text-[#5a5c63]">
               The task stays approved — top up demo funds in Wallet, then pay again. Nothing was debited.
@@ -269,10 +309,10 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           <div className="flex items-center gap-2">
             <button
               type="submit"
-              disabled={busy}
+              disabled={busy || !actualValid}
               className="flex-1 px-4 py-2.5 rounded-lg bg-[#0b1c30] text-white text-[14px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-60"
             >
-              {showProcessing ? 'Processing demo payment…' : `Pay ₹${task.requested_amount.toLocaleString()}`}
+              {showProcessing ? 'Processing demo payment…' : `Pay ₹${actual.toLocaleString()}`}
             </button>
             <button type="button" onClick={onBack} disabled={busy} className="px-4 py-2.5 rounded-lg bg-[#eef1f6] text-[#0b1c30] text-[13px] font-medium hover:bg-[#e2e7f0] cursor-pointer disabled:opacity-60">
               Back

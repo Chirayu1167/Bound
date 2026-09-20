@@ -34,10 +34,10 @@ function kindFor(category: string): OrderKind {
   return 'shopping';
 }
 
-const KIND_META: Record<OrderKind, { icon: string; noun: string; simulatedSteps: string[] }> = {
-  food: { icon: '🍔', noun: 'Order', simulatedSteps: ['Restaurant accepted', 'Preparing', 'Out for delivery', 'Delivered'] },
-  shopping: { icon: '📦', noun: 'Order', simulatedSteps: ['Preparing', 'Shipped', 'Out for delivery', 'Delivered'] },
-  travel: { icon: '✈️', noun: 'Booking', simulatedSteps: ['Confirmed with carrier', 'Check-in opens', 'Boarding', 'Arrived'] },
+const KIND_META: Record<OrderKind, { icon: string; noun: string; eta: string; simulatedSteps: string[] }> = {
+  food: { icon: '🍔', noun: 'Order', eta: '~30–40 min', simulatedSteps: ['Restaurant accepted', 'Preparing', 'Out for delivery', 'Delivered'] },
+  shopping: { icon: '📦', noun: 'Order', eta: '3–5 days', simulatedSteps: ['Preparing', 'Shipped', 'Out for delivery', 'Delivered'] },
+  travel: { icon: '✈️', noun: 'Booking', eta: 'E-ticket on confirmation', simulatedSteps: ['Confirmed with carrier', 'Check-in opens', 'Boarding', 'Arrived'] },
 };
 
 export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transactions, agents, approvals, walletTxns, onNavigate }) => {
@@ -107,13 +107,23 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
                       <p className="text-[12px] text-[#76777d] truncate">{t.merchant} · {t.category}</p>
                     </div>
                   </div>
-                  <p className="text-[16px] font-semibold text-[#0b1c30] shrink-0">₹{t.requested_amount.toLocaleString()}</p>
+                  <p className="text-[16px] font-semibold text-[#0b1c30] shrink-0">₹{(paid && payment ? payment.amount : t.requested_amount).toLocaleString()}</p>
                 </div>
 
                 <p className="text-[12px] text-[#5a5c63] mt-2">
                   {kind === 'travel' ? 'Booked' : 'Ordered'} by <span className="font-medium text-[#0b1c30]">{agent ? agent.name : t.domain_agent_id}</span>
                   {payment && <span className="text-[#76777d]"> · Ref {payment.id.slice(0, 8)}… (demo)</span>}
                 </p>
+                {payment?.item_summary && (
+                  <p className="text-[13px] text-[#0b1c30] mt-1 break-words">{payment.item_summary}</p>
+                )}
+                <div className="mt-1.5 flex items-center gap-3 text-[12px] flex-wrap">
+                  <span className="text-[#76777d]">Authorized up to <span className="font-medium text-[#0b1c30]">₹{t.requested_amount.toLocaleString()}</span></span>
+                  {paid && payment && (
+                    <span className="text-[#0a6b4a] font-medium">Final amount ₹{payment.amount.toLocaleString()}</span>
+                  )}
+                  <span className="text-[#76777d]">Arrives in <span className="font-medium text-[#0b1c30]">{meta.eta}</span> <span className="text-[#9a9ba1]">(simulated)</span></span>
+                </div>
 
                 <ol className="mt-3 space-y-1.5">
                   <Step done label={tx && tx.decision === 'ALLOW' ? 'Order placed' : 'Authorization checked'} sub={tx ? (tx.decision === 'ALLOW' ? 'Within your rule' : tx.reason) : t.reason || t.status} />

@@ -182,6 +182,12 @@ class MockPayment(Base):
     failure_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Final charge, set at execution from the caller-supplied actual_amount
+    # (validated <= task ceiling). amount keeps the authorized snapshot until
+    # success, then mirrors the charge so every reader sees one number.
+    actual_amount = Column(Float, nullable=True)
+    # Short user-supplied order summary (e.g. "Paneer Biryani + Coke").
+    item_summary = Column(Text, nullable=True)
 
 
 class Wallet(Base):

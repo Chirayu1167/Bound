@@ -132,6 +132,70 @@ class TestWalletDebit:
         assert len([e for e in _ledger() if e["direction"] == "DEBIT"]) == 0
 
 
+class TestFinalAmount:
+    def _new_payment(self, ceiling, merchant="Swiggy"):
+        agent, _m = _seed_domain(cap=ceiling)
+        task = _approved_task(agent["id"], ceiling, merchant=merchant)
+        r = client.post("/mock-payments/create", json={"task_id": task["id"], "payment_method": "Demo Balance"})
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    def test_final_below_ceiling_debits_actual(self):
+        pay_id = self._new_payment(500)
+        before = _wallet()["balance"]
+        r = client.post(f"/mock-payments/{pay_id}/execute",
+                        json={"simulate_failure": False, "actual_amount": 445,
+                              "item_summary": "Paneer Biryani + Coke"})
+        assert r.status_code == 200, r.text
+        done = r.json()
+        assert done["status"] == "SUCCEEDED"
+        assert done["amount"] == 445.0
+        assert done["actual_amount"] == 445.0
+        assert done["authorized_amount"] == 500.0
+        assert done["item_summary"] == "Paneer Biryani + Coke"
+        assert done["wallet_balance_after"] == before - 445
+        assert _wallet()["balance"] == before - 445
+        debits = [e for e in _ledger() if e["direction"] == "DEBIT"]
+        assert len(debits) == 1 and debits[0]["amount"] == 445.0
+
+    def test_final_equal_to_ceiling_succeeds(self):
+        pay_id = self._new_payment(500)
+        before = _wallet()["balance"]
+        r = client.post(f"/mock-payments/{pay_id}/execute",
+                        json={"simulate_failure": False, "actual_amount": 500})
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "SUCCEEDED"
+        assert _wallet()["balance"] == before - 500
+
+    def test_final_above_ceiling_fails_without_debit_or_completion(self):
+        pay_id = self._new_payment(500)
+        before = _wallet()
+        r = client.post(f"/mock-payments/{pay_id}/execute",
+                        json={"simulate_failure": False, "actual_amount": 530})
+        assert r.status_code == 200, r.text
+        failed = r.json()
+        assert failed["status"] == "FAILED"
+        assert "exceeds your" in failed["failure_reason"] and "530" in failed["failure_reason"]
+        after = _wallet()
+        assert after["balance"] == before["balance"]
+        assert after["total_debited"] == before["total_debited"]
+        assert len([e for e in _ledger() if e["direction"] == "DEBIT"]) == 0
+        # Task stays APPROVED for its ceiling; correcting the actual retries cleanly.
+        r = client.post(f"/mock-payments/{pay_id}/execute",
+                        json={"simulate_failure": False, "actual_amount": 500})
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "SUCCEEDED"
+        assert _wallet()["balance"] == before["balance"] - 500
+
+    def test_invalid_actual_rejected(self):
+        pay_id = self._new_payment(500)
+        for bad in (0, -10, 50_000_000, "lots"):
+            r = client.post(f"/mock-payments/{pay_id}/execute",
+                            json={"simulate_failure": False, "actual_amount": bad})
+            assert r.status_code == 422, (bad, r.text)
+        assert _wallet()["balance"] == 10000.0
+
+
 class TestDemoReset:
     def test_reset_disabled_by_default(self):
         _clear_db()

@@ -193,14 +193,17 @@ export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, wa
             {filtered.map((t) => {
               const pay = paymentByTx.get(t.id);
               const bal = pay ? balanceByPayment.get(pay.id) : undefined;
+              // The charge can differ from the authorization ceiling: the
+              // payment row owns the charged number, the transaction the ceiling.
+              const charged = pay && pay.status === 'SUCCEEDED' && pay.amount !== t.rawAmount ? pay.amount : null;
               return (
               <li key={t.id}>
                 <button onClick={() => onSelect(t)} className="w-full text-left px-4 py-3.5 hover:bg-[#f7f8fb] cursor-pointer flex items-center justify-between gap-3">
                   <div className="min-w-0">
                     <p className="text-[13px] text-[#0b1c30]">
-                      <span className="font-semibold">{t.amount}</span> · {t.merchant} <span className="text-[#76777d]">· {t.merchant_category}</span>
+                      <span className="font-semibold">{charged != null ? `₹${charged.toLocaleString()}` : t.amount}</span> · {t.merchant} <span className="text-[#76777d]">· {t.merchant_category}</span>
                     </p>
-                    <p className="text-[12px] text-[#76777d] mt-0.5 truncate">{t.agent} · {t.timestamp}{t.reason && t.decision !== 'ALLOW' ? ` · Why? ${t.reason}` : ''}{bal != null ? ` · Balance ₹${bal.toLocaleString()}` : ''}</p>
+                    <p className="text-[12px] text-[#76777d] mt-0.5 truncate">{t.agent} · {t.timestamp}{charged != null ? ` · Charged ₹${charged.toLocaleString()} of ${t.amount} authorized` : ''}{t.reason && t.decision !== 'ALLOW' ? ` · Why? ${t.reason}` : ''}{bal != null ? ` · Balance ₹${bal.toLocaleString()}` : ''}</p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     {taskByTx.has(t.id) && (
@@ -400,6 +403,10 @@ function TransactionDrawer({ tx, agents, mandates, balanceAfter, task, approval,
                     {payment.status === 'SUCCEEDED' ? 'Paid (demo)' : payment.status.charAt(0) + payment.status.slice(1).toLowerCase()}
                   </span>
                 </p>
+                {payment.authorized_amount != null && payment.authorized_amount !== payment.amount && (
+                  <p className="text-[12px] text-[#5a5c63]">Authorized up to ₹{payment.authorized_amount.toLocaleString()} · charged ₹{payment.amount.toLocaleString()}</p>
+                )}
+                {payment.item_summary && <p className="text-[12px] text-[#0b1c30]">“{payment.item_summary}”</p>}
                 <p className="text-[12px] text-[#76777d]">
                   Ref: {payment.id} · {payment.payment_method}
                   {payment.completed_at ? ` · ${new Date(payment.completed_at).toLocaleString()}` : ''}
