@@ -222,3 +222,45 @@ class TestDemoReset:
             assert _ledger()[0]["kind"] == "INITIAL"
         finally:
             os.environ.pop("ALLOW_DEMO_RESET", None)
+
+
+class TestDemoSeedAgents:
+    def test_guard_disabled_by_default(self):
+        _clear_db()
+        os.environ.pop("ALLOW_DEMO_RESET", None)
+        r = client.post("/demo/seed-agents")
+        assert r.status_code == 403, r.text
+        assert client.get("/agents").json() == []
+
+    def test_seeds_four_agents_idempotent(self):
+        _clear_db()
+        os.environ["ALLOW_DEMO_RESET"] = "true"
+        try:
+            r = client.post("/demo/seed-agents")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert len(body["seeded"]) == 4, body
+            agents = {a["domain"]: a for a in client.get("/agents").json() if not a.get("is_task_agent")}
+            assert set(agents) == {"FOOD", "TRAVEL", "SHOPPING", "BILLS"}, agents.keys()
+            mandates = client.get("/mandates").json()
+            caps = {m["agent_id"]: m["max_amount"] for m in mandates if m["status"] == "ACTIVE"}
+            assert caps[agents["FOOD"]["id"]] == 1000.0
+            assert caps[agents["TRAVEL"]["id"]] == 15000.0
+            assert caps[agents["SHOPPING"]["id"]] == 5000.0
+            assert caps[agents["BILLS"]["id"]] == 5000.0
+            # Second call creates nothing.
+            r = client.post("/demo/seed-agents")
+            assert r.status_code == 200, r.text
+            assert r.json()["seeded"] == [] and len(r.json()["existing"]) == 4
+            # No transactions/tasks/payments were invented.
+            assert client.get("/transactions").json() == []
+            assert client.get("/tasks").json() == []
+            assert _wallet()["balance"] == 10000.0
+        finally:
+            os.environ.pop("ALLOW_DEMO_RESET", None)
+
+    def test_bills_domain_accepted(self):
+        _clear_db()
+        r = client.post("/agents", json={"name": "Bills Agent", "description": "t", "domain": "BILLS"})
+        assert r.status_code == 201, r.text
+        assert r.json()["domain"] == "BILLS"

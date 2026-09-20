@@ -47,7 +47,12 @@ const DOMAIN_KEYWORDS: Record<DomainId, string[]> = {
   shopping: [
     'buy', 'purchase', 'shoes', 'shirt', 'clothes', 'clothing', 'electronics',
     'phone', 'laptop', 'headphones', 'earbuds', 'watch', 'bag', 'dress', 'jeans',
-    'shopping',
+    'shopping', 'amazon', 'flipkart',
+  ],
+  bills: [
+    'bill', 'bills', 'billing', 'utility', 'utilities', 'electricity', 'power',
+    'water', 'gas', 'cylinder', 'recharge', 'prepaid', 'postpaid', 'broadband',
+    'wifi', 'dth', 'subscription', 'subscriptions', 'bescom', 'bwssb',
   ],
 };
 
@@ -62,12 +67,14 @@ const PURPOSE_MAP: Array<{ words: string[]; purpose: string }> = [
   { words: ['hotel', 'hotels'], purpose: 'Hotel booking' },
   { words: ['taxi', 'cab', 'uber', 'ola'], purpose: 'Ride' },
   { words: ['train'], purpose: 'Train booking' },
+  { words: ['bill', 'bills', 'electricity', 'recharge', 'subscription', 'subscriptions'], purpose: 'Bill payment' },
 ];
 
 export const DOMAIN_DEFAULT_PURPOSE: Record<DomainId, string> = {
   food: 'Food order',
   travel: 'Travel booking',
   shopping: 'Shopping order',
+  bills: 'Bill payment',
 };
 
 function escapeRegExp(s: string): string {
@@ -134,6 +141,7 @@ export function parseRequest(rawText: string): ParsedIntent {
     food: countHits(text, DOMAIN_KEYWORDS.food),
     travel: countHits(text, DOMAIN_KEYWORDS.travel),
     shopping: countHits(text, DOMAIN_KEYWORDS.shopping),
+    bills: countHits(text, DOMAIN_KEYWORDS.bills),
   };
   const ranked = (Object.keys(scores) as DomainId[]).sort((a, b) => scores[b] - scores[a]);
   const top = ranked[0];

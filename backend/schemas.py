@@ -7,7 +7,7 @@ import json
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
-VALID_AGENT_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "OTHER")
+VALID_AGENT_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "BILLS", "OTHER")
 
 
 class AgentCreate(BaseModel):

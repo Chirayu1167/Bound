@@ -256,12 +256,27 @@ export default function App() {
 
   // Home task → real backend task. The decision, risk, approval token and
   // provenance all come from POST /tasks/authorize; the UI only displays.
+  //
+  // Semantic bridge (why "pizza" works under a "Groceries" rule): the intent
+  // layer (Groq first, deterministic fallback) decides only the DOMAIN —
+  // pizza/dinner/groceries are all food. When that domain agrees with the
+  // chosen agent's backend domain, the request is sent in the mandate's own
+  // scope wording, so word-matching can't false-negative a legitimate
+  // request (₹400 pizza under a ₹1,000 food rule approves). When the domains
+  // DISAGREE (headphones via Food Agent), the user's raw words go through
+  // untouched, so the engine honestly returns NEEDS_REVIEW. Amount, caps,
+  // status, delegation, risk and approval stay 100% backend-enforced —
+  // Groq/the bridge can never authorize money.
   const handleCheckTask = async (input: TaskCheckInput) => {
+    const mandate = mandates.find((m) => m.id === input.draft.mandateId) || null;
+    const agent = mandate ? agents.find((a) => a.id === mandate.agent_id) || null : null;
+    const domainAgrees =
+      !!mandate && !!agent && input.draft.domainId.toUpperCase() === agent.domain;
     const res = await api.authorizeTask({
       domain_agent_id: input.draft.agentId || '',
-      purpose: input.purpose,
+      purpose: domainAgrees && mandate ? mandate.purpose : input.purpose,
       requested_amount: input.budget,
-      category: mandates.find((m) => m.id === input.draft.mandateId)?.merchant_category || 'General',
+      category: mandate?.merchant_category || 'General',
       merchant: input.merchant,
     });
     if (res.approval && res.approval_token) {
@@ -373,6 +388,28 @@ export default function App() {
     }
   };
 
+  // Quick-create for the request flow: when the user asks for a domain with
+  // no agent yet ("You don't have a Food Agent yet. Create one?"), one click
+  // builds the agent + its standing rule from the domain's suggested defaults
+  // (user can edit everything later in Agents). The caller re-runs the saved
+  // request text afterwards, so the user never retypes.
+  const handleQuickCreateAgent = async (domainId: DomainId) => {
+    const domain = DOMAINS.find((d) => d.id === domainId);
+    if (!domain) throw new Error('Unknown domain.');
+    const created = await api.createAgent({
+      name: domain.suggestedAgentName,
+      description: `${domain.suggestedPurpose} — managed via Bound`,
+      domain: domainId.toUpperCase(),
+    });
+    await api.createMandate({
+      agent_id: created.id,
+      purpose: domain.suggestedPurpose,
+      max_amount: domain.suggestedCap,
+      merchant_category: domain.categories[0],
+    });
+    await refreshData();
+    showToast(`${created.name} created (₹${domain.suggestedCap.toLocaleString()} per ${domain.unitWord}). Continue your request below.`);
+  };
   // Step 1 of explicit domain setup: create the agent (confirmed in dialog,
   // including its backend domain and the category the rule will cover).
   // Step 2 opens the normal rule form prefilled — the rule is a separate
@@ -465,6 +502,7 @@ export default function App() {
             onSetupDomain={setSetupDomainId}
             notify={showToast}
             onTopup={handleTopup}
+            onQuickCreateAgent={handleQuickCreateAgent}
           />
         )}
 

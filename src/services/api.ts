@@ -620,7 +620,7 @@ export async function topupWallet(amount: number): Promise<WalletInfo> {
 // Optional LLM intent assist — Groq behind the backend (key never in browser)
 // ---------------------------------------------------------------------------
 export interface InterpretResult {
-  domain: 'food' | 'travel' | 'shopping' | null;
+  domain: 'food' | 'travel' | 'shopping' | 'bills' | null;
   purpose: string | null;
   budget: number | null;
   merchant: string | null;

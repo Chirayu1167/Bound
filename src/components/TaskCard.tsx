@@ -59,7 +59,12 @@ export const TaskCard: React.FC<TaskCardProps> = ({
 
   const domain = DOMAINS.find((d) => d.id === pickedDomain) || DOMAINS[0];
   const resolved = agent && mandate;
-  const wordingOk = !mandate || !purpose.trim() || purposeOverlapsRule(mandate.purpose, mandate.merchant_category, purpose);
+  // The check sends the mandate's own scope wording whenever the request's
+  // domain agrees with the agent's domain — so in-domain wording (pizza under
+  // a Groceries rule) never warns or false-negatives. Only a genuine domain
+  // mismatch warns, because those words go through untouched.
+  const domainAgrees = !!agent && draft.domainId.toUpperCase() === agent.domain;
+  const wordingOk = domainAgrees || !mandate || !purpose.trim() || purposeOverlapsRule(mandate.purpose, mandate.merchant_category, purpose);
 
   const pick = (id: DomainId) => {
     setPickedDomain(id);

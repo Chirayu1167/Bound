@@ -12,7 +12,7 @@ def gen_id(prefix: str) -> str:
 # Explicit user-facing domains. Stored on the agent so domain resolution never
 # has to guess from names/purposes/categories (Phase 1 inference is retired).
 # OTHER = unclassified or internal machinery (e.g. delegated executors).
-VALID_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "OTHER")
+VALID_DOMAINS = ("FOOD", "TRAVEL", "SHOPPING", "BILLS", "OTHER")
 
 
 class Agent(Base):

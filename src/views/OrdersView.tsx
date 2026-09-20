@@ -133,7 +133,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
                     label={approval ? (approval.status === 'APPROVED' ? 'Approval granted' : approval.status === 'DENIED' ? 'Approval denied' : 'Approval waiting') : needsReview ? 'No approval available' : 'No approval needed'}
                     sub={approval ? `One-time · ${approval.status.toLowerCase()}` : needsReview ? 'Outside the rule — see Activity' : 'Within your rule'}
                   />
-                  <Step done={paid} current={!paid} label={paid ? 'Payment completed (demo)' : payment ? `Payment ${payment.status.toLowerCase()} (demo)` : 'Not paid yet'} sub={paid ? `${payment?.completed_at ? `${new Date(payment.completed_at).toLocaleString()} · ` : ''}${bal != null ? `Balance ₹${bal.toLocaleString()}` : ''}` : payment?.completed_at ? new Date(payment.completed_at).toLocaleString() : undefined} />
+                  <Step done={paid} current={!paid} label={paid ? 'Payment completed (demo)' : payment ? `Payment ${payment.status.toLowerCase()} (demo)` : 'Not paid yet'} sub={paid ? `${payment?.completed_at ? `${new Date(payment.completed_at).toLocaleString()} · ` : ''}${bal != null ? `Wallet ₹${(bal + (payment?.amount ?? 0)).toLocaleString()} → ₹${bal.toLocaleString()}` : ''}` : payment?.completed_at ? new Date(payment.completed_at).toLocaleString() : undefined} />
                 </ol>
 
                 <div className="mt-3 rounded-lg border border-dashed border-[#c6c6cd] bg-[#fafbff] px-3 py-2.5">

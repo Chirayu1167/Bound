@@ -21,12 +21,13 @@
 
 import type { AgentNode, MandateItem } from './types';
 
-export type DomainId = 'food' | 'travel' | 'shopping';
+export type DomainId = 'food' | 'travel' | 'shopping' | 'bills';
 
 export const DOMAIN_CATEGORIES: Record<DomainId, string[]> = {
   food: ['Grocery', 'Dining'],
   travel: ['Airlines', 'Hotels', 'Transport'],
   shopping: ['General', 'Electronics', 'Apparel'],
+  bills: ['Utilities', 'Subscriptions', 'Bills'],
 };
 
 export interface DomainDef {
@@ -36,7 +37,7 @@ export interface DomainDef {
   agentLabel: string;
   icon: string;
   /** Unit word for displaying a per-transaction cap honestly. */
-  unitWord: 'order' | 'booking';
+  unitWord: 'order' | 'booking' | 'payment';
   /** Suggested values for the explicit setup flow (user confirms/edits). */
   suggestedAgentName: string;
   suggestedPurpose: string;
@@ -80,8 +81,19 @@ export const DOMAINS: DomainDef[] = [
     unitWord: 'order',
     suggestedAgentName: 'Shopping Agent',
     suggestedPurpose: 'Shopping, electronics and apparel',
-    suggestedCap: 2000,
+    suggestedCap: 5000,
     categories: DOMAIN_CATEGORIES.shopping,
+  },
+  {
+    id: 'bills',
+    label: 'Bills',
+    agentLabel: 'Bills Agent',
+    icon: '🧾',
+    unitWord: 'payment',
+    suggestedAgentName: 'Bills Agent',
+    suggestedPurpose: 'Utilities, subscriptions and bills',
+    suggestedCap: 5000,
+    categories: DOMAIN_CATEGORIES.bills,
   },
 ];
 

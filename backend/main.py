@@ -234,7 +234,7 @@ def _create_agent_internal(
     if existing:
         agent_id = f"{base_id}-{uuid.uuid4().hex[:4]}"
     domain = (payload.domain or "OTHER").upper()
-    if domain not in ("FOOD", "TRAVEL", "SHOPPING", "OTHER"):
+    if domain not in ("FOOD", "TRAVEL", "SHOPPING", "BILLS", "OTHER"):
         raise HTTPException(status_code=400, detail=f"Invalid domain {payload.domain}")
     agent = models.Agent(
         id=agent_id,
@@ -1197,6 +1197,79 @@ def demo_reset_api(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# Demo agent seeding — the 4 clean starter agents (explicit, idempotent)
+#
+# Creates real backend agents + standing mandates, one per domain, ONLY for
+# domains that have no ACTIVE user agent yet. Never duplicates, never touches
+# transactions/tasks/approvals/payments/provenance. Same guard as demo/reset.
+# ---------------------------------------------------------------------------
+DEMO_AGENT_SEEDS = (
+    {"domain": "FOOD", "name": "Food Agent",
+     "description": "Food, dining and groceries — up to INR 1,000 per order",
+     "purpose": "Food, dinner and groceries", "max_amount": 1000, "merchant_category": "Grocery"},
+    {"domain": "TRAVEL", "name": "Travel Agent",
+     "description": "Flights, hotels and transport — up to INR 15,000 per trip",
+     "purpose": "Flights, hotels and travel", "max_amount": 15000, "merchant_category": "Airlines"},
+    {"domain": "SHOPPING", "name": "Shopping Agent",
+     "description": "Electronics, apparel and shopping — up to INR 5,000 per order",
+     "purpose": "Shopping, electronics and apparel", "max_amount": 5000, "merchant_category": "General"},
+    {"domain": "BILLS", "name": "Bills Agent",
+     "description": "Utilities, subscriptions and bills — up to INR 5,000 per payment",
+     "purpose": "Utilities, subscriptions and bills", "max_amount": 5000, "merchant_category": "Utilities"},
+)
+
+
+@app.post("/demo/seed-agents")
+def demo_seed_agents(db: Session = Depends(get_db)):
+    if os.getenv("ALLOW_DEMO_RESET", "false").strip().lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Demo seeding is disabled (set ALLOW_DEMO_RESET=true to enable).",
+        )
+    seeded: list[str] = []
+    existing: list[str] = []
+    for spec in DEMO_AGENT_SEEDS:
+        agent = (
+            db.query(models.Agent)
+            .filter(
+                models.Agent.domain == spec["domain"],
+                models.Agent.status == "ACTIVE",
+                models.Agent.is_task_agent == False,  # noqa: E712
+            )
+            .first()
+        )
+        if agent is None:
+            agent = _create_agent_internal(
+                schemas.AgentCreate(name=spec["name"], description=spec["description"], domain=spec["domain"]),
+                db,
+            )
+            seeded.append(agent.id)
+        else:
+            existing.append(agent.id)
+        mandate = (
+            db.query(models.Mandate)
+            .filter(models.Mandate.agent_id == agent.id, models.Mandate.status == "ACTIVE")
+            .first()
+        )
+        if mandate is None:
+            _create_mandate_internal(
+                schemas.MandateCreate(
+                    agent_id=agent.id,
+                    purpose=spec["purpose"],
+                    max_amount=spec["max_amount"],
+                    merchant_category=spec["merchant_category"],
+                ),
+                db,
+            )
+    return {"seeded": seeded, "existing": existing}
+
+
+@app.post("/api/demo/seed-agents")
+def demo_seed_agents_api(db: Session = Depends(get_db)):
+    return demo_seed_agents(db)
+
+
+# ---------------------------------------------------------------------------
 # AI intent assist — optional Groq layer (suggestion only, never authority)
 #
 # POST /ai/interpret turns free text into a structured task proposal
@@ -1206,19 +1279,19 @@ def demo_reset_api(db: Session = Depends(get_db)):
 # without it the endpoint returns 501 and the product keeps working on its
 # built-in deterministic parser. Uses stdlib HTTP only (no new dependency).
 # ---------------------------------------------------------------------------
-_GROQ_ALLOWED_DOMAINS = {"food", "travel", "shopping"}
+_GROQ_ALLOWED_DOMAINS = {"food", "travel", "shopping", "bills"}
 _GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 _GROQ_SYSTEM_PROMPT = (
-    "You interpret a user's shopping/food/travel request for the Bound app. "
+    "You interpret a user's shopping/food/travel/bills request for the Bound app. "
     "Reply with JSON ONLY, no other text, using exactly these keys: "
-    '{"domain": "food"|"travel"|"shopping"|null, "purpose": string|null, '
+    '{"domain": "food"|"travel"|"shopping"|"bills"|null, "purpose": string|null, '
     '"budget": number|null, "merchant": string|null, "category": string|null, '
     '"explanation": string|null}. '
-    "domain is the area (food/travel/shopping) or null when unclear. "
-    "purpose is a short label like Dinner, Flight booking, Headphones. "
+    "domain is the area (food/travel/shopping/bills) or null when unclear. "
+    "purpose is a short label like Dinner, Pizza, Flight booking, Headphones, Electricity bill. "
     "budget is the max amount in INR as a number, or null. "
-    "merchant is the named store/service or null. "
-    "category is one of Grocery, Dining, General, Electronics, Apparel, Airlines, Hotels, Transport, Fuel, or null. "
+    "merchant is the named store/service (e.g. Swiggy, Domino's, IndiGo, Amazon, BESCOM) or null. "
+    "category is one of Grocery, Dining, General, Electronics, Apparel, Airlines, Hotels, Transport, Utilities, Subscriptions, Bills, Fuel, or null. "
     "explanation is one short line or null."
 )
 
@@ -1459,7 +1532,7 @@ def update_agent(agent_id: str, payload: dict, db: Session = Depends(get_db)):
         agent.description = payload["description"]
     if "domain" in payload:
         norm = str(payload["domain"]).strip().upper() if payload["domain"] else "OTHER"
-        if norm not in ("FOOD", "TRAVEL", "SHOPPING", "OTHER"):
+        if norm not in ("FOOD", "TRAVEL", "SHOPPING", "BILLS", "OTHER"):
             raise HTTPException(status_code=400, detail="Invalid domain")
         agent.domain = norm
     db.commit()

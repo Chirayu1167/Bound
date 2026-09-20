@@ -49,6 +49,7 @@ interface WalletViewProps {
   notify: (msg: string) => void;
   onVerifyReplay?: (payment: MockPaymentItem) => Promise<string>;
   onTopup: (amount: number) => Promise<void>;
+  onQuickCreateAgent: (domainId: DomainId) => Promise<void>;
 }
 
 interface DraftState {
@@ -97,6 +98,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
   notify,
   onVerifyReplay,
   onTopup,
+  onQuickCreateAgent,
 }) => {
   const [draftState, setDraftState] = useState<DraftState | null>(null);
   const [notUnderstood, setNotUnderstood] = useState<string | null>(null);
@@ -115,6 +117,10 @@ export const WalletView: React.FC<WalletViewProps> = ({
   const [topupAmount, setTopupAmount] = useState('5000');
   const [topupBusy, setTopupBusy] = useState(false);
   const [topupError, setTopupError] = useState<string | null>(null);
+  // Original request text, kept so creating a missing agent can continue it.
+  const [pendingText, setPendingText] = useState('');
+  const [quickBusy, setQuickBusy] = useState(false);
+  const [quickError, setQuickError] = useState<string | null>(null);
   // Phase 5: in-memory session context only. Nothing here is persisted and
   // nothing here authorizes — it only pre-fills what the user then confirms.
   const [session, setSession] = useState<SessionContext>(emptySession);
@@ -203,10 +209,14 @@ export const WalletView: React.FC<WalletViewProps> = ({
     setCheckError(null);
     setConversation(null);
     setPendingRefAsk(null);
-    let intent = parseRequest(text);
-    // Optional LLM assist: only when the deterministic parser is uncertain,
-    // and only to pre-fill the draft. Any failure falls back silently.
-    if ((intent.kind === 'unknown' || !intent.domainId) && text.trim()) {
+    setPendingText(text);
+    const deterministic = parseRequest(text);
+    // Groq first: understands phrasing the keyword parser misses ("pizza",
+    // merchant names like Domino's). Draft-only pre-fill — it never
+    // authorizes, and any failure falls back to the deterministic parser.
+    let intent = deterministic;
+    let groqMerchant: string | null = null;
+    if (text.trim()) {
       try {
         const g = await interpretRequest(text);
         if (g.groq && (g.domain || g.purpose || g.budget !== null || g.merchant)) {
@@ -223,7 +233,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
             return;
           }
           intent = { ...intent, kind: 'request', purpose: g.purpose ?? intent.purpose, budget: g.budget ?? intent.budget, notes };
-          if (g.merchant) touchSession({ merchant: g.merchant });
+          groqMerchant = g.merchant;
         }
       } catch {
         /* offline, no key, or timeout — deterministic path below */
@@ -246,7 +256,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
         return;
       }
       if (ref !== 'none' && session.domainId) {
-        routeAsk(text, intent, null);
+        routeAsk(text, intent, null, groqMerchant);
         return;
       }
       if (ref !== 'none') {
@@ -257,15 +267,15 @@ export const WalletView: React.FC<WalletViewProps> = ({
       }
       const fallback: DomainId = 'food';
       setNotUnderstood(null);
-      setDraftState({ ...makeDraftState(fallback, intent.purpose || 'Order', intent.budget, null, intent.notes) });
+      setDraftState({ ...makeDraftState(fallback, intent.purpose || 'Order', intent.budget, groqMerchant, intent.notes) });
       touchSession({ domainId: fallback, purpose: intent.purpose ?? null });
       return;
     }
-    routeAsk(text, intent, null);
+    routeAsk(text, intent, null, groqMerchant);
   };
 
   /** Route a parsed request, optionally with a domain forced by disambiguation. */
-  const routeAsk = (text: string, intent: ParsedIntent, forcedDomain: DomainId | null) => {
+  const routeAsk = (text: string, intent: ParsedIntent, forcedDomain: DomainId | null, merchantSeedOverride: string | null = null) => {
     const ref = detectReference(text, intent.budget != null);
     if (ref === 'spending-query') {
       const domainId = forcedDomain ?? intent.domainId ?? session.domainId;
@@ -291,15 +301,15 @@ export const WalletView: React.FC<WalletViewProps> = ({
       return;
     }
     // Normal draft flow. Explicit values always win; a merchant may still be
-    // borrowed from context when the text names none.
+    // borrowed from context (or the AI suggestion) when the text names none.
     const domainId = forcedDomain ?? intent.domainId ?? session.domainId;
     if (!domainId) return;
     const def = DOMAINS.find((d) => d.id === domainId);
-    // Borrow a merchant only when the text names none: session first (most
-    // recent interaction), else last historical merchant. Still editable,
-    // still requires an explicit check click.
-    let merchantSeed: string | null = null;
-    if (ref === 'last-transaction' || ref === 'same-merchant') {
+    // Borrow a merchant only when the text names none: AI suggestion first,
+    // then session (most recent interaction), else last historical merchant.
+    // Still editable, still requires an explicit check click.
+    let merchantSeed: string | null = merchantSeedOverride;
+    if (!merchantSeed && (ref === 'last-transaction' || ref === 'same-merchant')) {
       const last = historyForDomain(transactions, def?.categories || []).last;
       merchantSeed =
         session.domainId === domainId && session.merchant
@@ -461,6 +471,11 @@ export const WalletView: React.FC<WalletViewProps> = ({
         agentId: result.task.domain_agent_id,
         lastTaskStatus: result.task.status,
       });
+      // Within authority the check approves outright — take the user straight
+      // to payment (they still confirm and click Pay; money never moves alone).
+      if (result.task.status === 'APPROVED') {
+        openPayment(result.task);
+      }
     } catch (e: unknown) {
       setCheckError(e instanceof Error ? e.message : 'The check failed.');
     } finally {
@@ -525,6 +540,26 @@ export const WalletView: React.FC<WalletViewProps> = ({
   const draftMandate = draftState ? mandates.find((m) => m.id === draftState.draft.mandateId) || null : null;
   const draftDef = draftState ? DOMAINS.find((d) => d.id === draftState.domainId) : null;
   const merchantSuggestions = draftDef ? usualMerchants(transactions, draftDef.categories) : [];
+  const draftDomainHasAgent = draftState
+    ? agents.some((a) => a.domain === draftState.domainId.toUpperCase() && a.status === 'ACTIVE' && !a.is_task_agent)
+    : true;
+
+  /** One-click agent creation that continues the saved request afterwards. */
+  const handleQuickCreate = async () => {
+    if (!draftState) return;
+    const def = DOMAINS.find((d) => d.id === draftState.domainId);
+    if (!def) return;
+    setQuickBusy(true);
+    setQuickError(null);
+    try {
+      await onQuickCreateAgent(def.id);
+      if (pendingText) await handleAsk(pendingText);
+    } catch (e: unknown) {
+      setQuickError(e instanceof Error ? e.message : 'Could not create the agent.');
+    } finally {
+      setQuickBusy(false);
+    }
+  };
 
   const openPayment = (task: TaskItem) => {
     setPayingTaskId(task.id);
@@ -818,7 +853,40 @@ export const WalletView: React.FC<WalletViewProps> = ({
         </div>
       )}
 
-      {draftState && (
+      {draftState && !draftDomainHasAgent && (() => {
+        const def = DOMAINS.find((d) => d.id === draftState.domainId);
+        if (!def) return null;
+        return (
+          <div className="rounded-xl bg-white border border-[#0b1c30]/25 p-5">
+            <h2 className="text-[15px] font-semibold text-[#0b1c30]">
+              You don&apos;t have a {def.agentLabel} yet. Create one?
+            </h2>
+            <p className="text-[13px] text-[#5a5c63] mt-1.5">
+              It gets a bounded rule — {def.suggestedPurpose}, up to ₹{def.suggestedCap.toLocaleString()} per {def.unitWord} — 
+              never access to all your money. Your request continues automatically after creation.
+            </p>
+            {quickError && <p className="text-[13px] text-[#93000a] mt-2">{quickError}</p>}
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleQuickCreate}
+                disabled={quickBusy}
+                className="px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-60"
+              >
+                {quickBusy ? 'Creating…' : `Create ${def.agentLabel}`}
+              </button>
+              <button
+                onClick={() => { setDraftState(null); setCheckError(null); }}
+                disabled={quickBusy}
+                className="px-4 py-2 rounded-lg bg-[#eef1f6] text-[#0b1c30] text-[13px] font-medium hover:bg-[#e2e7f0] cursor-pointer disabled:opacity-60"
+              >
+                Not now
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {draftState && draftDomainHasAgent && (
         <TaskCard
           key={draftState.nonce}
           draft={draftState.draft}
