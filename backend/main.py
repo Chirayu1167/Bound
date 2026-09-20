@@ -1270,6 +1270,99 @@ def demo_seed_agents_api(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# Demo history seeding — a small realistic past, built ONLY through the real
+# engine (authorize → approve → pay), so wallet, ledger, activity and audit
+# agree exactly as if the user had done it. Guarded + skipped when history
+# already exists (never duplicates, never fakes records).
+# ---------------------------------------------------------------------------
+DEMO_HISTORY_STORIES = (
+    {"domain": "FOOD", "requested": 800, "merchant": "Swiggy",
+     "actual": 640, "item": "Margherita Pizza + Coke"},
+    {"domain": "SHOPPING", "requested": 1500, "merchant": "Amazon",
+     "actual": 1299, "item": "Wireless Headphones"},
+    {"domain": "TRAVEL", "requested": 3600, "merchant": "IndiGo",
+     "actual": 3450, "item": "DEL 6E-221 Economy"},
+    {"domain": "BILLS", "requested": 800, "merchant": "BESCOM",
+     "actual": 765, "item": "Electricity bill"},
+)
+DEMO_PENDING_STORY = {"domain": "FOOD", "purpose": "Urgent grocery profit prize deal",
+                      "requested": 900, "category": "Grocery", "merchant": "Lucky Mart"}
+
+
+@app.post("/demo/seed-history")
+def demo_seed_history(db: Session = Depends(get_db)):
+    if os.getenv("ALLOW_DEMO_RESET", "false").strip().lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Demo seeding is disabled (set ALLOW_DEMO_RESET=true to enable).",
+        )
+    if db.query(models.Transaction).count() > 0:
+        return {"seeded": False, "reason": "history exists — reset first for a clean demo"}
+    demo_seed_agents(db)
+    paid: list[str] = []
+    for story in DEMO_HISTORY_STORIES:
+        agent = (
+            db.query(models.Agent)
+            .filter(models.Agent.domain == story["domain"], models.Agent.status == "ACTIVE",
+                    models.Agent.is_task_agent == False)  # noqa: E712
+            .first()
+        )
+        mandate = (
+            db.query(models.Mandate)
+            .filter(models.Mandate.agent_id == agent.id, models.Mandate.status == "ACTIVE")
+            .first()
+        )
+        resp = _handle_idempotent_task_authorize(
+            schemas.TaskAuthorizeRequest(
+                domain_agent_id=agent.id,
+                purpose=mandate.purpose,
+                requested_amount=story["requested"],
+                category=mandate.merchant_category,
+                merchant=story["merchant"],
+            ),
+            db,
+        )
+        if resp.approval is not None:
+            resolve_approval(
+                resp.approval.id,
+                schemas.ApprovalResolveRequest(token=resp.approval_token or "", action="approve"),
+                db,
+            )
+        payment = create_mock_payment(
+            schemas.MockPaymentCreate(task_id=resp.task.id, payment_method="Demo Balance"), db
+        )
+        done = execute_mock_payment(
+            payment.id,
+            schemas.MockPaymentExecute(simulate_failure=False, actual_amount=story["actual"],
+                                       item_summary=story["item"]),
+            db,
+        )
+        paid.append(done.id)
+    pending = _handle_idempotent_task_authorize(
+        schemas.TaskAuthorizeRequest(
+            domain_agent_id=db.query(models.Agent).filter(
+                models.Agent.domain == DEMO_PENDING_STORY["domain"],
+                models.Agent.status == "ACTIVE",
+                models.Agent.is_task_agent == False,  # noqa: E712
+            ).first().id,
+            purpose=DEMO_PENDING_STORY["purpose"],
+            requested_amount=DEMO_PENDING_STORY["requested"],
+            category=DEMO_PENDING_STORY["category"],
+            merchant=DEMO_PENDING_STORY["merchant"],
+        ),
+        db,
+    )
+    return {"seeded": True, "payments": paid,
+            "pending_approval": pending.approval.id if pending.approval else None,
+            "wallet": _wallet_to_response(db, _get_wallet(db))}
+
+
+@app.post("/api/demo/seed-history")
+def demo_seed_history_api(db: Session = Depends(get_db)):
+    return demo_seed_history(db)
+
+
+# ---------------------------------------------------------------------------
 # AI intent assist — optional Groq layer (suggestion only, never authority)
 #
 # POST /ai/interpret turns free text into a structured task proposal

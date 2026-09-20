@@ -23,6 +23,8 @@ interface OrdersViewProps {
   approvals: ApprovalItem[];
   walletTxns: WalletTx[];
   onNavigate: (tab: ActiveTab) => void;
+  /** One-tap reorder: fills the Wallet ask bar and switches to it. */
+  onReorder: (text: string) => void;
 }
 
 type OrderKind = 'food' | 'travel' | 'shopping';
@@ -40,7 +42,7 @@ const KIND_META: Record<OrderKind, { icon: string; noun: string; eta: string; si
   travel: { icon: '✈️', noun: 'Booking', eta: 'E-ticket on confirmation', simulatedSteps: ['Confirmed with carrier', 'Check-in opens', 'Boarding', 'Arrived'] },
 };
 
-export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transactions, agents, approvals, walletTxns, onNavigate }) => {
+export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transactions, agents, approvals, walletTxns, onNavigate, onReorder }) => {
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const balanceByPayment = useMemo(() => {
     const m = new Map<string, number>();
@@ -158,6 +160,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
                     {approval && <TechRow k="Approval" v={`${approval.id} (${approval.status})`} />}
                     {payment && <TechRow k="Payment" v={`${payment.id} (${payment.status})`} />}
                   </TechnicalDetails>
+                </div>
+
+                <div className="mt-2.5 flex gap-2">
+                  <button
+                    onClick={() => onReorder(`Order ${t.purpose} under ₹${t.requested_amount.toLocaleString()} from ${t.merchant}`)}
+                    className="px-3.5 py-2 rounded-lg bg-[#eef1f6] text-[#0b1c30] text-[13px] font-medium hover:bg-[#e2e7f0] cursor-pointer"
+                  >
+                    Reorder ↻
+                  </button>
                 </div>
               </div>
             );

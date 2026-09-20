@@ -548,6 +548,7 @@ export default function App() {
             approvals={approvals}
             walletTxns={walletTxns}
             onNavigate={setActiveTab}
+            onReorder={handleFillAsk}
           />
         )}
 

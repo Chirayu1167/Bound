@@ -4,9 +4,11 @@ interface AskBarProps {
   onAsk: (text: string) => void;
   /** External preset (e.g. demo scenario). Applied when nonce changes. */
   preset?: { text: string; nonce: number } | null;
+  /** While the agent is working, the bar locks to prevent double-runs. */
+  busy?: boolean;
 }
 
-export const AskBar: React.FC<AskBarProps> = ({ onAsk, preset }) => {
+export const AskBar: React.FC<AskBarProps> = ({ onAsk, preset, busy = false }) => {
   const [value, setValue] = useState('');
 
   useEffect(() => {
@@ -28,13 +30,14 @@ export const AskBar: React.FC<AskBarProps> = ({ onAsk, preset }) => {
         <input
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="Order me dinner under ₹800"
+          placeholder={busy ? 'Agent is working…' : 'Order me dinner under ₹800'}
           aria-label="Describe what you want done"
-          className="flex-1 min-w-0 px-4 py-3 rounded-xl text-[14px] text-[#0b1c30] bg-[#f7f8fb] border border-[#e2e3e8] outline-none focus:border-[#0051d5] focus:bg-white placeholder:text-[#9a9ba1]"
+          disabled={busy}
+          className="flex-1 min-w-0 px-4 py-3 rounded-xl text-[14px] text-[#0b1c30] bg-[#f7f8fb] border border-[#e2e3e8] outline-none focus:border-[#0051d5] focus:bg-white placeholder:text-[#9a9ba1] disabled:opacity-60"
         />
         <button
           type="submit"
-          disabled={!value.trim()}
+          disabled={!value.trim() || busy}
           className="px-5 py-3 rounded-xl bg-[#0b1c30] text-white text-[14px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-40 shrink-0"
         >
           Go →

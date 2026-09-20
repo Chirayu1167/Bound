@@ -18,6 +18,7 @@ import { TaskCard, type TaskCheckInput } from '../components/TaskCard';
 import { TaskResultCard } from '../components/TaskResultCard';
 import { ApprovalCard } from '../components/ApprovalCard';
 import { PaymentScreen } from '../components/PaymentScreen';
+import { ProposalCard, type ProposalInput } from '../components/ProposalCard';
 import { ActivityFeed } from '../components/ActivityFeed';
 import { DEMO_APPS, connectionsForApps } from '../apps';
 import { executeMockPayment, interpretRequest, type WalletInfo, type WalletTx } from '../services/api';
@@ -66,6 +67,14 @@ function domainDefForAgent(agent: AgentNode | undefined): DomainDef | null {
   if (!agent || agent.is_task_agent) return null;
   return DOMAINS.find((d) => d.id.toUpperCase() === agent.domain) || null;
 }
+
+/** Default merchant per domain when neither the request nor history names one. Bills varies too much — always ask. */
+const DOMAIN_DEFAULT_MERCHANT: Record<DomainId, string | null> = {
+  food: 'Swiggy',
+  travel: 'IndiGo',
+  shopping: 'Amazon',
+  bills: null,
+};
 
 function isLiveTask(t: TaskItem, now: number): boolean {
   if (t.status === 'CANCELLED' || t.status === 'EXPIRED' || t.status === 'COMPLETED') return false;
@@ -121,6 +130,17 @@ export const WalletView: React.FC<WalletViewProps> = ({
   const [pendingText, setPendingText] = useState('');
   const [quickBusy, setQuickBusy] = useState(false);
   const [quickError, setQuickError] = useState<string | null>(null);
+  // Edit-mode toggle: the proposal card is the default smart path; the full
+  // TaskCard form is one tap away for anything unusual.
+  const [editMode, setEditMode] = useState(false);
+  const [execBusy, setExecBusy] = useState(false);
+  const [execStage, setExecStage] = useState<'checking' | 'paying' | null>(null);
+  const [execError, setExecError] = useState<string | null>(null);
+  // Auto-run: the agent works a fully-resolved request on its own (one tap
+  // was the typed request itself). Anything ambiguous falls back to manual.
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoStage, setAutoStage] = useState<'checking' | 'paying' | null>(null);
+  const [autoInfo, setAutoInfo] = useState<{ agentName: string; icon: string; purpose: string; merchant: string; max: number } | null>(null);
   // Phase 5: in-memory session context only. Nothing here is persisted and
   // nothing here authorizes — it only pre-fills what the user then confirms.
   const [session, setSession] = useState<SessionContext>(emptySession);
@@ -204,12 +224,79 @@ export const WalletView: React.FC<WalletViewProps> = ({
     };
   };
 
+  /** Merchant resolution order: named > usual spot (history) > domain default. */
+  const resolveMerchantFor = (domainId: DomainId, override: string | null): { merchant: string | null; note: string | null } => {
+    if (override) return { merchant: override, note: null };
+    const def = DOMAINS.find((d) => d.id === domainId);
+    const last = historyForDomain(transactions, def?.categories || []).last;
+    if (last?.merchant) return { merchant: last.merchant, note: `Usual spot: ${last.merchant} — change it below.` };
+    const usual = DOMAIN_DEFAULT_MERCHANT[domainId];
+    if (usual) return { merchant: usual, note: `Trying ${usual} — change it below.` };
+    return { merchant: null, note: null };
+  };
+
+  /**
+   * Auto-run: a fully-resolved request (agent + amount + merchant) executes
+   * on its own — the typed request is the instruction, the standing rule is
+   * the permission. Real authorize → (if APPROVED) real pay, with visible
+   * progress. Anything else (no agent, review, error) falls back to the
+   * manual cards. Returns true when it took the request.
+   */
+  const autoRun = async (
+    domainId: DomainId,
+    purpose: string,
+    budget: number,
+    merchant: string,
+    notes: string[]
+  ): Promise<boolean> => {
+    const res = resolveDomainAgent(domainId, agents, mandates);
+    if (!res) return false;
+    const def = DOMAINS.find((d) => d.id === domainId);
+    setAutoBusy(true);
+    setAutoStage('checking');
+    setAutoInfo({ agentName: res.agent.name, icon: def?.icon || '🤖', purpose, merchant, max: budget });
+    try {
+      const draft = createTaskDraft(domainId, purpose, budget, res.agent.id, res.mandate.id);
+      const result = await onCheckTask({ draft, merchant, purpose, budget });
+      touchSession({
+        domainId, purpose, amount: budget, merchant,
+        agentId: result.task.domain_agent_id,
+        lastTaskStatus: result.task.status,
+      });
+      if (result.task.status !== 'APPROVED') {
+        setLastResult({ task: result.task, approval: result.approval });
+        return true;
+      }
+      setAutoStage('paying');
+      openPayment(result.task);
+      const item = purpose && purpose !== DOMAIN_DEFAULT_PURPOSE[domainId] ? purpose : null;
+      await handlePay(result.task, 'Demo Balance', '', budget, item);
+      return true;
+    } catch (e: unknown) {
+      // Stranded requests fall back to an editable draft, never vanish.
+      setDraftState({
+        draft: createTaskDraft(domainId, purpose, budget, res.agent.id, res.mandate.id),
+        domainId, notes: [...notes, 'Auto-run hit a snag — review and continue manually.'],
+        nonce: Date.now(), merchantSeed: merchant,
+      });
+      notify(e instanceof Error ? e.message : 'Auto-run failed — continue manually below.');
+      return true;
+    } finally {
+      setAutoBusy(false);
+      setAutoStage(null);
+      setAutoInfo(null);
+    }
+  };
+
   const handleAsk = async (text: string) => {
+    if (autoBusy || checking) return;
     setLastResult(null);
     setCheckError(null);
     setConversation(null);
     setPendingRefAsk(null);
     setPendingText(text);
+    setEditMode(false);
+    setExecError(null);
     const deterministic = parseRequest(text);
     // Groq first: understands phrasing the keyword parser misses ("pizza",
     // merchant names like Domino's). Draft-only pre-fill — it never
@@ -227,9 +314,17 @@ export const WalletView: React.FC<WalletViewProps> = ({
           ];
           if (g.domain) {
             const d = g.domain as DomainId;
+            const purpose = g.purpose || DOMAIN_DEFAULT_PURPOSE[d];
+            const resolved = resolveMerchantFor(d, g.merchant);
+            const allNotes = [...notes, ...(resolved.note ? [resolved.note] : [])];
+            // Fully resolved → the agent just does it. Otherwise the draft
+            // card takes over for the missing piece.
+            if (g.budget != null && resolved.merchant) {
+              if (await autoRun(d, purpose, g.budget, resolved.merchant, allNotes)) return;
+            }
             setNotUnderstood(null);
-            setDraftState({ ...makeDraftState(d, g.purpose || DOMAIN_DEFAULT_PURPOSE[d], g.budget, g.merchant, notes) });
-            touchSession({ domainId: d, purpose: g.purpose ?? null, amount: g.budget, merchant: g.merchant });
+            setDraftState({ ...makeDraftState(d, purpose, g.budget, resolved.merchant, allNotes) });
+            touchSession({ domainId: d, purpose: g.purpose ?? null, amount: g.budget, merchant: resolved.merchant });
             return;
           }
           intent = { ...intent, kind: 'request', purpose: g.purpose ?? intent.purpose, budget: g.budget ?? intent.budget, notes };
@@ -256,7 +351,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
         return;
       }
       if (ref !== 'none' && session.domainId) {
-        routeAsk(text, intent, null, groqMerchant);
+        await routeAsk(text, intent, null, groqMerchant);
         return;
       }
       if (ref !== 'none') {
@@ -267,15 +362,28 @@ export const WalletView: React.FC<WalletViewProps> = ({
       }
       const fallback: DomainId = 'food';
       setNotUnderstood(null);
-      setDraftState({ ...makeDraftState(fallback, intent.purpose || 'Order', intent.budget, groqMerchant, intent.notes) });
+      const fallbackDef = DOMAINS.find((d) => d.id === fallback);
+      const fallbackLast = historyForDomain(transactions, fallbackDef?.categories || []).last;
+      const fallbackSeed = groqMerchant || fallbackLast?.merchant || DOMAIN_DEFAULT_MERCHANT[fallback];
+      const fallbackNotes = [
+        ...intent.notes,
+        ...(groqMerchant || fallbackLast?.merchant || !DOMAIN_DEFAULT_MERCHANT[fallback]
+          ? []
+          : [`Trying ${DOMAIN_DEFAULT_MERCHANT[fallback]} — change it below.`]),
+        ...(fallbackLast?.merchant && !groqMerchant ? [`Usual spot: ${fallbackLast.merchant} — change it below.`] : []),
+      ];
+      if (intent.budget != null && fallbackSeed && ref === 'none') {
+        if (await autoRun(fallback, intent.purpose || 'Order', intent.budget, fallbackSeed, fallbackNotes)) return;
+      }
+      setDraftState({ ...makeDraftState(fallback, intent.purpose || 'Order', intent.budget, fallbackSeed, fallbackNotes) });
       touchSession({ domainId: fallback, purpose: intent.purpose ?? null });
       return;
     }
-    routeAsk(text, intent, null, groqMerchant);
+    await routeAsk(text, intent, null, groqMerchant);
   };
 
   /** Route a parsed request, optionally with a domain forced by disambiguation. */
-  const routeAsk = (text: string, intent: ParsedIntent, forcedDomain: DomainId | null, merchantSeedOverride: string | null = null) => {
+  const routeAsk = async (text: string, intent: ParsedIntent, forcedDomain: DomainId | null, merchantSeedOverride: string | null = null) => {
     const ref = detectReference(text, intent.budget != null);
     if (ref === 'spending-query') {
       const domainId = forcedDomain ?? intent.domainId ?? session.domainId;
@@ -306,9 +414,10 @@ export const WalletView: React.FC<WalletViewProps> = ({
     if (!domainId) return;
     const def = DOMAINS.find((d) => d.id === domainId);
     // Borrow a merchant only when the text names none: AI suggestion first,
-    // then session (most recent interaction), else last historical merchant.
-    // Still editable, still requires an explicit check click.
+    // then session (most recent interaction), else last historical merchant,
+    // else the domain's usual spot. Still editable, still requires confirm.
     let merchantSeed: string | null = merchantSeedOverride;
+    const seedNotes: string[] = [];
     if (!merchantSeed && (ref === 'last-transaction' || ref === 'same-merchant')) {
       const last = historyForDomain(transactions, def?.categories || []).last;
       merchantSeed =
@@ -316,9 +425,27 @@ export const WalletView: React.FC<WalletViewProps> = ({
           ? session.merchant
           : last?.merchant || null;
     }
+    if (!merchantSeed) {
+      const last = historyForDomain(transactions, def?.categories || []).last;
+      if (last?.merchant) {
+        merchantSeed = last.merchant;
+        seedNotes.push(`Usual spot: ${last.merchant} — change it below.`);
+      } else {
+        const usual = DOMAIN_DEFAULT_MERCHANT[domainId];
+        if (usual) {
+          merchantSeed = usual;
+          seedNotes.push(`Trying ${usual} — change it below.`);
+        }
+      }
+    }
     setNotUnderstood(null);
+    const allNotes = [...intent.notes, ...seedNotes];
+    // Direct request with everything resolved → the agent just does it.
+    if (ref === 'none' && intent.budget != null && merchantSeed) {
+      if (await autoRun(domainId, intent.purpose || 'Order', intent.budget, merchantSeed, allNotes)) return;
+    }
     setDraftState({
-      ...makeDraftState(domainId, intent.purpose || 'Order', intent.budget, merchantSeed, intent.notes),
+      ...makeDraftState(domainId, intent.purpose || 'Order', intent.budget, merchantSeed, allNotes),
     });
     const res = resolveDomainAgent(domainId, agents, mandates);
     touchSession({
@@ -403,7 +530,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
     const text = pendingRefAsk;
     setPendingRefAsk(null);
     if (!text) return;
-    routeAsk(text, parseRequest(text), d);
+    void routeAsk(text, parseRequest(text), d);
   };
 
   const acceptBudget = (amount: number) => {
@@ -480,6 +607,48 @@ export const WalletView: React.FC<WalletViewProps> = ({
       setCheckError(e instanceof Error ? e.message : 'The check failed.');
     } finally {
       setChecking(false);
+    }
+  };
+
+  /** One-tap agent execution: authorize, and when approved pay immediately
+   * with the confirmed final amount. Anything needing review falls back to
+   * the approval UI. Two real backend calls, one user tap — the tap shows
+   * agent, merchant, max, charge and wallet impact up front. */
+  const handleConfirmPay = async (input: ProposalInput) => {
+    if (!draftState) return;
+    setExecBusy(true);
+    setExecError(null);
+    setExecStage('checking');
+    try {
+      const result = await onCheckTask({
+        draft: draftState.draft,
+        merchant: input.merchant,
+        purpose: draftState.draft.purpose,
+        budget: input.max,
+      });
+      touchSession({
+        merchant: input.merchant,
+        amount: input.charge,
+        agentId: result.task.domain_agent_id,
+        lastTaskStatus: result.task.status,
+      });
+      if (result.task.status !== 'APPROVED') {
+        setLastResult({ task: result.task, approval: result.approval });
+        setDraftState(null);
+        setConversation(null);
+        notify('Needs review — see why below.');
+        return;
+      }
+      setExecStage('paying');
+      openPayment(result.task);
+      await handlePay(result.task, 'Demo Balance', '', input.charge, input.item);
+      setDraftState(null);
+      setConversation(null);
+    } catch (e: unknown) {
+      setExecError(e instanceof Error ? e.message : 'That didn\u2019t work.');
+    } finally {
+      setExecBusy(false);
+      setExecStage(null);
     }
   };
 
@@ -801,7 +970,35 @@ export const WalletView: React.FC<WalletViewProps> = ({
       </div>
 
       {/* 3. Ask Bound */}
-      <AskBar onAsk={handleAsk} preset={askPreset} />
+      <AskBar onAsk={handleAsk} preset={askPreset} busy={autoBusy} />
+
+      {autoBusy && autoInfo && !payingTaskId && (
+        <div className="rounded-xl bg-white border border-[#0b1c30]/25 p-5">
+          <div className="flex items-center gap-2.5">
+            <span className="w-9 h-9 rounded-xl bg-[#0b1c30] text-white flex items-center justify-center text-[18px] shrink-0">
+              {autoInfo.icon}
+            </span>
+            <div className="min-w-0 flex-1">
+              <h2 className="text-[15px] font-semibold text-[#0b1c30] truncate">
+                {autoInfo.agentName} is on it
+              </h2>
+              <p className="text-[12px] text-[#76777d] truncate">
+                {autoInfo.purpose} · {autoInfo.merchant} · up to ₹{autoInfo.max.toLocaleString()}
+              </p>
+            </div>
+            <span className="w-5 h-5 border-[3px] border-[#e2e3e8] border-t-[#0b1c30] rounded-full animate-spin shrink-0" />
+          </div>
+          <div className="mt-3 rounded-lg bg-[#f7f8fb] border border-[#eef0f4] px-3 py-2.5 space-y-1">
+            <p className="text-[13px] text-[#0a6b4a]">✓ Understood your request</p>
+            <p className={`text-[13px] ${autoStage === 'checking' ? 'text-[#0b1c30] font-medium' : 'text-[#0a6b4a]'}`}>
+              {autoStage === 'checking' ? '●' : '✓'} Checking authority with Bound
+            </p>
+            {autoStage === 'paying' && (
+              <p className="text-[13px] text-[#0b1c30] font-medium">● Paying from your demo wallet…</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 4. At a glance — control center summary */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -886,7 +1083,31 @@ export const WalletView: React.FC<WalletViewProps> = ({
         );
       })()}
 
-      {draftState && draftDomainHasAgent && (
+      {draftState && draftDomainHasAgent && draftAgent && draftMandate && draftState.draft.budget != null && !editMode && (
+        <ProposalCard
+          key={`proposal-${draftState.nonce}`}
+          agentName={draftAgent.name}
+          agentIcon={draftDef?.icon || '🤖'}
+          ruleLine={draftDef ? ruleSummary(draftMandate, draftDef) : null}
+          purpose={draftState.draft.purpose}
+          notes={draftState.notes}
+          initialMerchant={draftState.merchantSeed}
+          initialMax={draftState.draft.budget}
+          walletBalance={wallet?.balance ?? null}
+          busy={execBusy}
+          stage={execStage}
+          error={execError}
+          onConfirm={handleConfirmPay}
+          onEdit={() => setEditMode(true)}
+          onDismiss={() => {
+            setDraftState(null);
+            setCheckError(null);
+            setExecError(null);
+          }}
+        />
+      )}
+
+      {draftState && draftDomainHasAgent && (editMode || !draftAgent || !draftMandate || draftState.draft.budget == null) && (
         <TaskCard
           key={draftState.nonce}
           draft={draftState.draft}

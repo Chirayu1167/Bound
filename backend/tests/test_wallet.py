@@ -264,3 +264,41 @@ class TestDemoSeedAgents:
         r = client.post("/agents", json={"name": "Bills Agent", "description": "t", "domain": "BILLS"})
         assert r.status_code == 201, r.text
         assert r.json()["domain"] == "BILLS"
+
+
+class TestDemoSeedHistory:
+    def test_guard_disabled_by_default(self):
+        _clear_db()
+        os.environ.pop("ALLOW_DEMO_RESET", None)
+        r = client.post("/demo/seed-history")
+        assert r.status_code == 403, r.text
+
+    def test_history_built_on_real_flows_and_consistent(self):
+        _clear_db()
+        os.environ["ALLOW_DEMO_RESET"] = "true"
+        try:
+            r = client.post("/demo/seed-history")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["seeded"] is True
+            assert len(body["payments"]) == 4
+            assert body["pending_approval"] is not None
+            # Wallet reflects exactly the four charges.
+            w = _wallet()
+            assert w["balance"] == 10000.0 - (640 + 1299 + 3450 + 765)
+            assert w["total_debited"] == 640 + 1299 + 3450 + 765
+            debits = sorted(e["amount"] for e in _ledger() if e["direction"] == "DEBIT")
+            assert debits == [640.0, 765.0, 1299.0, 3450.0]
+            # Payments show charges, never ceilings.
+            pays = {p["id"]: p for p in client.get("/mock-payments").json()}
+            assert sorted(p["amount"] for p in pays.values()) == [640.0, 765.0, 1299.0, 3450.0]
+            # Pending review is genuine PENDING state.
+            approvals = [a for a in client.get("/approvals").json() if a["id"] == body["pending_approval"]]
+            assert len(approvals) == 1 and approvals[0]["status"] == "PENDING"
+            # Second call refuses to duplicate.
+            r = client.post("/demo/seed-history")
+            assert r.status_code == 200, r.text
+            assert r.json()["seeded"] is False
+            assert len([e for e in _ledger() if e["direction"] == "DEBIT"]) == 4
+        finally:
+            os.environ.pop("ALLOW_DEMO_RESET", None)
