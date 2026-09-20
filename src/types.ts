@@ -1,4 +1,4 @@
-export type ActiveTab = 'home' | 'agents' | 'rules' | 'activity' | 'audit' | 'preferences';
+export type ActiveTab = 'home' | 'agents' | 'apps' | 'orders' | 'activity' | 'audit' | 'preferences';
 
 export type AgentDomain = 'FOOD' | 'TRAVEL' | 'SHOPPING' | 'OTHER';
 

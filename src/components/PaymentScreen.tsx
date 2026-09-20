@@ -20,6 +20,8 @@ interface PaymentScreenProps {
   onNewRequest: () => void;
   onViewActivity: () => void;
   onBack: () => void;
+  /** Re-attempts execution of the succeeded payment; resolves with the backend's rejection message (409). */
+  onVerifyReplay?: () => Promise<string>;
 }
 
 function riskLabel(level: string | null): string {
@@ -54,9 +56,23 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
   onNewRequest,
   onViewActivity,
   onBack,
+  onVerifyReplay,
 }) => {
   const [method, setMethod] = useState('Demo Balance');
   const [note, setNote] = useState('');
+  const [replayBusy, setReplayBusy] = useState(false);
+  const [replayMsg, setReplayMsg] = useState<string | null>(null);
+
+  const verifyReplay = async () => {
+    if (!onVerifyReplay || replayBusy) return;
+    setReplayBusy(true);
+    try {
+      const msg = await onVerifyReplay();
+      setReplayMsg(msg);
+    } finally {
+      setReplayBusy(false);
+    }
+  };
 
   const showProcessing = busy || payment?.status === 'PROCESSING' || payment?.status === 'CREATED';
   const succeeded = payment?.status === 'SUCCEEDED';
@@ -120,6 +136,18 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           </p>
           {payment.note && <p className="text-[12px] text-[#5a5c63] mt-1">“{payment.note}”</p>}
           <p className="text-[12px] text-[#76777d] mt-2">Simulated payment — no real money moved.</p>
+          <p className="text-[12px] text-[#0a6b4a] mt-1 font-medium">Approval token: consumed — it cannot be reused.</p>
+          {onVerifyReplay && (
+            <div className="mt-3 w-full rounded-lg border border-[#e2e3e8] bg-[#fafbff] px-3 py-2.5 text-left">
+              {replayMsg ? (
+                <p className="text-[12px] text-[#0b1c30]">✓ Replay blocked — {replayMsg}</p>
+              ) : (
+                <button onClick={verifyReplay} disabled={replayBusy} className="text-[12px] font-medium text-[#0051d5] hover:underline cursor-pointer disabled:opacity-60">
+                  {replayBusy ? 'Checking…' : 'Verify replay protection'}
+                </button>
+              )}
+            </div>
+          )}
           <div className="mt-4 flex gap-2 w-full">
             <button onClick={onNewRequest} className="flex-1 px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer">
               New request

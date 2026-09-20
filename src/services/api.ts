@@ -564,3 +564,37 @@ export async function getMockPayments(taskId?: string): Promise<MockPaymentItem[
   const q = taskId ? `?task_id=${encodeURIComponent(taskId)}` : '';
   return apiFetch<MockPaymentItem[]>(`/mock-payments${q}`);
 }
+
+// ---------------------------------------------------------------------------
+// Optional LLM intent assist — Groq behind the backend (key never in browser)
+// ---------------------------------------------------------------------------
+export interface InterpretResult {
+  domain: 'food' | 'travel' | 'shopping' | null;
+  purpose: string | null;
+  budget: number | null;
+  merchant: string | null;
+  category: string | null;
+  explanation: string | null;
+  /** True when Groq produced this; false means deterministic fallback. */
+  groq: boolean;
+}
+
+/**
+ * Ask the backend to interpret free text with Groq. The backend returns 501
+ * when GROQ_API_KEY is unset — like any other failure, the caller must fall
+ * back to the local deterministic parser. The result only pre-fills a draft;
+ * it never authorizes anything.
+ */
+export async function interpretRequest(text: string, timeoutMs = 6000): Promise<InterpretResult> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await apiFetch<InterpretResult>('/ai/interpret', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}

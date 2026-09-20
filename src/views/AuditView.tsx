@@ -41,8 +41,50 @@ function readableEvent(type: string): string {
   }
 }
 
-function TimelineFilter({ filter, onChange }: { filter: AuditFilter; onChange: (f: AuditFilter) => void }) {
-  const options: Array<{ id: AuditFilter; label: string }> = [
+/** Simple lifecycle for one payment, derived from its real audit events. */
+function PaymentFlow({ events }: { events: ProvenanceEvent[] }) {
+  const types = new Set(events.map((e) => e.event_type));
+  const steps: Array<{ label: string; state: 'done' | 'todo'; sub: string }> = [
+    {
+      label: 'Payment requested',
+      state: types.has('PAYMENT_REQUESTED') || types.has('TASK_CREATED') ? 'done' : 'todo',
+      sub: types.has('TASK_CREATED') ? 'Via task' : 'Recorded attempt',
+    },
+    {
+      label: 'Authorization checked',
+      state: types.has('AUTHORIZATION_DECIDED') ? 'done' : 'todo',
+      sub: 'Rule + risk engine',
+    },
+    {
+      label: types.has('APPROVAL_DENIED') ? 'Approval denied' : 'Approval granted',
+      state: types.has('APPROVAL_GRANTED') || types.has('APPROVAL_DENIED') ? 'done' : 'todo',
+      sub: types.has('APPROVAL_REQUESTED') || types.has('APPROVAL_GRANTED') || types.has('APPROVAL_DENIED') ? 'One-time' : 'Not required',
+    },
+    {
+      label: 'Payment completed',
+      state: types.has('MOCK_PAYMENT_SUCCEEDED') || types.has('PAYMENT_COMPLETED') ? 'done' : 'todo',
+      sub: 'Demo payment',
+    },
+  ];
+  return (
+    <ol className="mt-3 flex items-start gap-1">
+      {steps.map((s, i) => (
+        <li key={s.label} className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className={`w-5 h-5 rounded-full text-[10px] font-semibold flex items-center justify-center shrink-0 ${s.state === 'done' ? 'bg-[#e6f4ee] text-[#0a6b4a]' : 'bg-[#eef1f6] text-[#9a9ba1]'}`}>
+              {s.state === 'done' ? '✓' : i + 1}
+            </span>
+            {i < steps.length - 1 && <span className="flex-1 h-px bg-[#e2e3e8] min-w-2" />}
+          </div>
+          <p className={`text-[12px] mt-1 ${s.state === 'done' ? 'font-medium text-[#0b1c30]' : 'text-[#76777d]'}`}>{s.label}</p>
+          <p className="text-[11px] text-[#76777d]">{s.sub}</p>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function TimelineFilter({ filter, onChange }: { filter: AuditFilter; onChange: (f: AuditFilter) => void }) {  const options: Array<{ id: AuditFilter; label: string }> = [
     { id: 'all', label: 'All' },
     { id: 'auth', label: 'Authorization' },
     { id: 'approvals', label: 'Approvals' },
@@ -155,7 +197,7 @@ export const AuditView: React.FC<{ transactions: TransactionRecord[] }> = ({ tra
       <div className={`rounded-xl border p-4 ${verify?.valid ? 'bg-white border-[#bfe3d2]' : 'bg-[#fdf3f2] border-[#e8c4c0]'}`}>
         <div className="flex items-center gap-2">
           <span className={`w-2.5 h-2.5 rounded-full ${verify?.valid ? 'bg-[#0a6b4a]' : 'bg-[#ba1a1a]'}`} />
-          <p className="text-[14px] font-semibold text-[#0b1c30]">{verify?.valid ? 'Audit log verified' : 'Audit log needs attention'}</p>
+          <p className="text-[14px] font-semibold text-[#0b1c30]">{verify?.valid ? '✓ Provenance chain valid' : 'Audit log needs attention'}</p>
         </div>
         <p className="text-[13px] text-[#5a5c63] mt-1">
           {verify ? `${verify.events_checked} events checked` : 'No verification result yet'}
@@ -181,7 +223,9 @@ export const AuditView: React.FC<{ transactions: TransactionRecord[] }> = ({ tra
               {txEvents.length === 0 ? (
                 <p className="text-[13px] text-[#76777d]">No audit events found for this payment.</p>
               ) : (
-                <ul className="space-y-1.5">
+                <>
+                  <PaymentFlow events={txEvents} />
+                  <ul className="mt-3 space-y-1.5">
                   {txEvents.map((e) => (
                     <li key={e.id} className="text-[13px] rounded-lg border border-[#eef0f4] px-3 py-2">
                       <span className="font-medium text-[#0b1c30]">{readableEvent(e.event_type)}</span>
@@ -189,7 +233,8 @@ export const AuditView: React.FC<{ transactions: TransactionRecord[] }> = ({ tra
                       {e.reason && <span className="block text-[#45464d] mt-0.5">{e.reason}</span>}
                     </li>
                   ))}
-                </ul>
+                  </ul>
+                </>
               )}
             </div>
           </>

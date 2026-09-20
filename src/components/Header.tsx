@@ -10,7 +10,8 @@ interface HeaderProps {
 const TABS: Array<{ id: ActiveTab; label: string }> = [
   { id: 'home', label: 'Home' },
   { id: 'agents', label: 'Agents' },
-  { id: 'rules', label: 'Rules' },
+  { id: 'apps', label: 'Apps' },
+  { id: 'orders', label: 'Orders & Trips' },
   { id: 'activity', label: 'Activity' },
   { id: 'audit', label: 'Audit' },
   { id: 'preferences', label: 'Preferences' },

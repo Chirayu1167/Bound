@@ -417,4 +417,26 @@ class MerchantReputationResponse(BaseModel):
     recency_days: Optional[int] = None
     evidence: Optional[dict] = None
     tier: str
+
+
+# ---------------------------------------------------------------------------
+# AI intent assist — optional Groq layer (suggestion only, never authority)
+# ---------------------------------------------------------------------------
+class AiInterpretRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=500, example="Order me dinner under ₹800")
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def check_text(cls, v: Any):
+        return _strip_non_empty(v, "text")
+
+
+class AiInterpretResponse(BaseModel):
+    domain: Optional[str] = None
+    purpose: Optional[str] = None
+    budget: Optional[float] = None
+    merchant: Optional[str] = None
+    category: Optional[str] = None
+    explanation: Optional[str] = None
+    groq: bool = False
     signals: Optional[list] = None

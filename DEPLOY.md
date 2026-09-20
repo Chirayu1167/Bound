@@ -11,6 +11,8 @@ in the production path (the backend refuses to boot otherwise).
 | `ENV` | yes — set to `production` (also hides `/docs`) | `production` |
 | `CORS_ORIGINS` | yes — explicit frontend origin(s), comma-separated, no `*` | `https://bound.example.com` |
 | `PORT` | no — platform-provided; falls back to `4000` | `10000` |
+| `GROQ_API_KEY` | no — optional AI request assist; without it `/ai/interpret` returns 501 and the app uses its built-in parser | — |
+| `GROQ_MODEL` | no — Groq model id (default `llama-3.3-70b-versatile`) | `llama-3.3-70b-versatile` |
 
 ```bash
 pip install -r backend/requirements.txt

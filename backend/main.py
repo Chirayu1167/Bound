@@ -1130,6 +1130,127 @@ def health_api():
 
 
 # ---------------------------------------------------------------------------
+# AI intent assist — optional Groq layer (suggestion only, never authority)
+#
+# POST /ai/interpret turns free text into a structured task proposal
+# (domain/purpose/budget/merchant/category). The result only pre-fills the
+# UI draft: the user still confirms, and the deterministic authorization
+# engine still makes the only decision that matters. Requires GROQ_API_KEY;
+# without it the endpoint returns 501 and the product keeps working on its
+# built-in deterministic parser. Uses stdlib HTTP only (no new dependency).
+# ---------------------------------------------------------------------------
+_GROQ_ALLOWED_DOMAINS = {"food", "travel", "shopping"}
+_GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
+_GROQ_SYSTEM_PROMPT = (
+    "You interpret a user's shopping/food/travel request for the Bound app. "
+    "Reply with JSON ONLY, no other text, using exactly these keys: "
+    '{"domain": "food"|"travel"|"shopping"|null, "purpose": string|null, '
+    '"budget": number|null, "merchant": string|null, "category": string|null, '
+    '"explanation": string|null}. '
+    "domain is the area (food/travel/shopping) or null when unclear. "
+    "purpose is a short label like Dinner, Flight booking, Headphones. "
+    "budget is the max amount in INR as a number, or null. "
+    "merchant is the named store/service or null. "
+    "category is one of Grocery, Dining, General, Electronics, Apparel, Airlines, Hotels, Transport, Fuel, or null. "
+    "explanation is one short line or null."
+)
+
+
+def _call_groq_interpret(text: str) -> dict:
+    import json as _json
+    import urllib.request as _urlrequest
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=501,
+            detail="AI assist is not configured (GROQ_API_KEY missing) — use the built-in request form.",
+        )
+    model = os.getenv("GROQ_MODEL", _GROQ_MODEL_DEFAULT).strip() or _GROQ_MODEL_DEFAULT
+    body = _json.dumps(
+        {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 300,
+            "messages": [
+                {"role": "system", "content": _GROQ_SYSTEM_PROMPT},
+                {"role": "user", "content": text[:500]},
+            ],
+        }
+    ).encode("utf-8")
+    req = _urlrequest.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with _urlrequest.urlopen(req, timeout=10) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Groq interpret call failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="AI assist is unavailable right now — use the built-in request form.",
+        )
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        parsed = _json.loads(content) if isinstance(content, str) else content
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="AI assist returned an unreadable reply — use the built-in request form.",
+        )
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="AI assist returned an unreadable reply — use the built-in request form.",
+        )
+
+    domain = parsed.get("domain")
+    domain = str(domain).strip().lower() if isinstance(domain, str) else None
+    if domain not in _GROQ_ALLOWED_DOMAINS:
+        domain = None
+
+    def _short(v: object, limit: int) -> str | None:
+        if not isinstance(v, str):
+            return None
+        v = v.strip()
+        return v[:limit] if v else None
+
+    budget = parsed.get("budget")
+    try:
+        budget = float(budget) if budget is not None else None
+    except (TypeError, ValueError):
+        budget = None
+    if budget is not None and not (0 < budget <= 10_000_000):
+        budget = None
+
+    category = _short(parsed.get("category"), 100)
+    return {
+        "domain": domain,
+        "purpose": _short(parsed.get("purpose"), 200),
+        "budget": budget,
+        "merchant": _short(parsed.get("merchant"), 200),
+        "category": category,
+        "explanation": _short(parsed.get("explanation"), 280),
+        "groq": True,
+    }
+
+
+@app.post("/ai/interpret", response_model=schemas.AiInterpretResponse)
+def ai_interpret(payload: schemas.AiInterpretRequest):
+    return _call_groq_interpret(payload.text)
+
+
+@app.post("/api/ai/interpret", response_model=schemas.AiInterpretResponse)
+def ai_interpret_api(payload: schemas.AiInterpretRequest):
+    return ai_interpret(payload)
+
+
+# ---------------------------------------------------------------------------
 # Provenance — Phase 5 (append-only, hash-linked)
 # ---------------------------------------------------------------------------
 @app.get("/provenance", response_model=list[schemas.ProvenanceEventResponse])

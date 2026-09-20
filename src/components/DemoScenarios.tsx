@@ -214,7 +214,7 @@ export const DemoScenarios: React.FC<DemoScenariosProps> = ({ onFillAsk, foodAge
           </p>
           <p className="text-[12px] text-[#5a5c63] mt-1.5 break-words">
             Ask “Order my usual dinner” after your usual grows past your rule — or lower the Food rule below
-            your usual in Rules → Edit (reversible) and ask again. Bound proposes the capped amount and shows
+            your usual in Agents → select the agent → Edit rule (reversible) and ask again. Bound proposes the capped amount and shows
             the conflict instead of approving the usual.
           </p>
           <p className="text-[12px] text-[#0a6b4a] mt-2 break-words">

@@ -12,13 +12,16 @@ import {
   medianApproved,
   type SessionContext,
 } from '../context';
-import { ConfirmDialog, DecisionBadge, EmptyState } from '../components/ui';
+import { ConfirmDialog, EmptyState } from '../components/ui';
 import { AskBar } from '../components/AskBar';
 import { TaskCard, type TaskCheckInput } from '../components/TaskCard';
 import { TaskResultCard } from '../components/TaskResultCard';
 import { ApprovalCard } from '../components/ApprovalCard';
 import { PaymentScreen } from '../components/PaymentScreen';
+import { ActivityFeed } from '../components/ActivityFeed';
 import { DemoScenarios } from '../components/DemoScenarios';
+import { DEMO_APPS, connectionsForApps } from '../apps';
+import { executeMockPayment, interpretRequest } from '../services/api';
 import { FlowSteps, type FlowStage } from '../components/FlowSteps';
 import { ConversationCard, type ConversationState } from '../components/ConversationCard';
 import type { TaskAuthorizeResult } from '../services/api';
@@ -42,6 +45,7 @@ interface HomeViewProps {
   onRevokeAgent: (agentId: string) => Promise<void>;
   onSetupDomain: (domainId: DomainId) => void;
   notify: (msg: string) => void;
+  onVerifyReplay?: (payment: MockPaymentItem) => Promise<string>;
 }
 
 interface DraftState {
@@ -85,6 +89,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onRevokeAgent,
   onSetupDomain,
   notify,
+  onVerifyReplay,
 }) => {
   const [draftState, setDraftState] = useState<DraftState | null>(null);
   const [notUnderstood, setNotUnderstood] = useState<string | null>(null);
@@ -125,7 +130,6 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
   const now = Date.now();
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
-  const recent = useMemo(() => transactions.slice(0, 5), [transactions]);
   const resolutions = useMemo(
     () => new Map(DOMAINS.map((d) => [d.id, resolveDomainAgent(d.id, agents, mandates)] as const)),
     [agents, mandates]
@@ -169,12 +173,37 @@ export const HomeView: React.FC<HomeViewProps> = ({
     };
   };
 
-  const handleAsk = (text: string) => {
+  const handleAsk = async (text: string) => {
     setLastResult(null);
     setCheckError(null);
     setConversation(null);
     setPendingRefAsk(null);
-    const intent = parseRequest(text);
+    let intent = parseRequest(text);
+    // Optional LLM assist: only when the deterministic parser is uncertain,
+    // and only to pre-fill the draft. Any failure falls back silently.
+    if ((intent.kind === 'unknown' || !intent.domainId) && text.trim()) {
+      try {
+        const g = await interpretRequest(text);
+        if (g.groq && (g.domain || g.purpose || g.budget !== null || g.merchant)) {
+          const notes = [
+            'Suggested by AI — confirm everything below before checking.',
+            ...(g.explanation ? [`AI note: ${g.explanation}`] : []),
+            ...(g.category ? [`Suggested category ${g.category} — the check itself uses your rule's category.`] : []),
+          ];
+          if (g.domain) {
+            const d = g.domain as DomainId;
+            setNotUnderstood(null);
+            setDraftState({ ...makeDraftState(d, g.purpose || DOMAIN_DEFAULT_PURPOSE[d], g.budget, g.merchant, notes) });
+            touchSession({ domainId: d, purpose: g.purpose ?? null, amount: g.budget, merchant: g.merchant });
+            return;
+          }
+          intent = { ...intent, kind: 'request', purpose: g.purpose ?? intent.purpose, budget: g.budget ?? intent.budget, notes };
+          if (g.merchant) touchSession({ merchant: g.merchant });
+        }
+      } catch {
+        /* offline, no key, or timeout — deterministic path below */
+      }
+    }
     if (intent.kind === 'cancel') {
       setDraftState(null);
       setNotUnderstood(null);
@@ -549,6 +578,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const waitingCount =
     tasks.filter((t) => t.status === 'NEEDS_REVIEW' && approvalByTask.get(t.id)?.status === 'PENDING').length +
     orphanReview.length;
+  const activeUserAgents = agents.filter((a) => !a.is_task_agent && a.status === 'ACTIVE');
+  const appConnections = connectionsForApps(DEMO_APPS, mandates, agents);
+  const connectedApps = appConnections.filter((c) => c.mandates.length > 0);
+  const activeOrders = tasks.filter((t) => t.status === 'APPROVED' || paymentByTask.has(t.id)).length;
   const flowStage: FlowStage | null = payingTaskId
     ? payment?.status === 'SUCCEEDED' || payment?.status === 'FAILED'
       ? 'result'
@@ -558,6 +591,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
       : draftState
         ? 'request'
         : null;
+
+  const handleVerifyReplay = async (pay: MockPaymentItem): Promise<string> => {
+    if (onVerifyReplay) return onVerifyReplay(pay);
+    try {
+      await executeMockPayment(pay.id);
+      return 'Payment executed again — this should not happen; please report it.';
+    } catch (e: unknown) {
+      return e instanceof Error ? e.message : 'Replay rejected by the backend.';
+    }
+  };
 
   const renderPaymentScreen = (task: TaskItem) => {
     const agent = agentById.get(task.domain_agent_id);
@@ -581,6 +624,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
         onRetry={handleRetry}
         onNewRequest={closePayment}
         onViewActivity={() => onNavigate('activity')}
+        onVerifyReplay={activePayment?.status === 'SUCCEEDED' ? () => handleVerifyReplay(activePayment) : undefined}
         onBack={() => {
           setPayingTaskId(null);
           setPayment(null);
@@ -642,6 +686,32 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
       {/* 3. Ask Bound */}
       <AskBar onAsk={handleAsk} preset={askPreset} />
+
+      {/* 4. At a glance — control center summary */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <button onClick={() => onNavigate('agents')} className="rounded-xl bg-white border border-[#e2e3e8] px-4 py-3 text-left hover:border-[#9a9ba1] cursor-pointer">
+          <p className="text-[22px] font-semibold text-[#0b1c30]">{activeUserAgents.length}</p>
+          <p className="text-[12px] text-[#5a5c63] mt-0.5">Active agent{activeUserAgents.length === 1 ? '' : 's'}</p>
+          <p className="text-[12px] text-[#0051d5] font-medium mt-1">Agents →</p>
+        </button>
+        <button onClick={() => onNavigate('apps')} className="rounded-xl bg-white border border-[#e2e3e8] px-4 py-3 text-left hover:border-[#9a9ba1] cursor-pointer">
+          <p className="text-[22px] font-semibold text-[#0b1c30]">{connectedApps.length}<span className="text-[14px] font-normal text-[#76777d]">/{DEMO_APPS.length}</span></p>
+          <p className="text-[12px] text-[#5a5c63] mt-0.5 truncate">
+            {connectedApps.length === 0 ? 'No apps connected' : `Connected: ${connectedApps.map((c) => c.app.name).slice(0, 2).join(', ')}${connectedApps.length > 2 ? '…' : ''}`}
+          </p>
+          <p className="text-[12px] text-[#0051d5] font-medium mt-1">Apps →</p>
+        </button>
+        <div className="rounded-xl bg-white border border-[#e2e3e8] px-4 py-3">
+          <p className={`text-[22px] font-semibold ${waitingCount > 0 ? 'text-[#93000a]' : 'text-[#0a6b4a]'}`}>{waitingCount}</p>
+          <p className="text-[12px] text-[#5a5c63] mt-0.5">Waiting approval</p>
+          <p className="text-[12px] text-[#76777d] mt-1">{waitingCount === 0 ? 'All clear' : 'Review above'}</p>
+        </div>
+        <button onClick={() => onNavigate('orders')} className="rounded-xl bg-white border border-[#e2e3e8] px-4 py-3 text-left hover:border-[#9a9ba1] cursor-pointer">
+          <p className="text-[22px] font-semibold text-[#0b1c30]">{activeOrders}</p>
+          <p className="text-[12px] text-[#5a5c63] mt-0.5">Active order{activeOrders === 1 ? '' : 's'} & trips</p>
+          <p className="text-[12px] text-[#0051d5] font-medium mt-1">Orders & Trips →</p>
+        </button>
+      </div>
 
       {notUnderstood && (
         <p className="text-[13px] text-[#5a5c63] bg-white border border-[#e2e3e8] rounded-xl px-4 py-3">{notUnderstood}</p>
@@ -763,8 +833,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 <p className="text-[14px] font-semibold text-[#0b1c30] mt-1">{res.agent.name}</p>
                 <p className="text-[13px] text-[#0b1c30] mt-0.5">{ruleSummary(res.mandate, d)}</p>
                 <p className="text-[12px] text-[#76777d] mt-0.5 truncate">{res.mandate.purpose}</p>
-                <button onClick={() => onNavigate('rules')} className="mt-2.5 text-[13px] font-medium text-[#0051d5] hover:underline cursor-pointer">
-                  View rule →
+                <button onClick={() => onNavigate('agents')} className="mt-2.5 text-[13px] font-medium text-[#0051d5] hover:underline cursor-pointer">
+                  View agent →
                 </button>
               </div>
             );
@@ -772,38 +842,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
         </div>
       </div>
 
-      {/* Recent */}
+      {/* Recent agent activity — real backend events, newest first */}
       <div>
         <div className="flex items-center justify-between">
-          <h2 className="text-[13px] font-semibold text-[#0b1c30] uppercase tracking-wide">Recent</h2>
-          {recent.length > 0 && (
-            <button onClick={() => onNavigate('activity')} className="text-[13px] font-medium text-[#0051d5] hover:underline cursor-pointer">
-              Activity →
-            </button>
-          )}
+          <h2 className="text-[13px] font-semibold text-[#0b1c30] uppercase tracking-wide">Recent agent activity</h2>
+          <button onClick={() => onNavigate('activity')} className="text-[13px] font-medium text-[#0051d5] hover:underline cursor-pointer">
+            Activity →
+          </button>
         </div>
         <div className="mt-2.5 rounded-xl bg-white border border-[#e2e3e8] overflow-hidden">
-          {recent.length === 0 ? (
-            <div className="p-4">
-              <EmptyState title="No activity yet" body="Approved tasks and reviews will appear here." />
-            </div>
-          ) : (
-            <ul className="divide-y divide-[#eef0f4]">
-              {recent.map((t) => (
-                <li key={t.id}>
-                  <button onClick={() => onSelectTransaction(t)} className="w-full text-left px-4 py-3 hover:bg-[#f7f8fb] cursor-pointer flex items-center justify-between gap-3">
-                    <p className="text-[13px] text-[#0b1c30] truncate min-w-0">
-                      <span className={t.decision === 'ALLOW' ? 'text-[#0a6b4a] font-medium' : 'text-[#93000a] font-medium'}>
-                        {t.decision === 'ALLOW' ? '✓' : '⚠'}{' '}
-                      </span>
-                      {t.purpose} — {t.amount} <span className="text-[#76777d]">· {t.merchant}</span>
-                    </p>
-                    <DecisionBadge decision={t.decision} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+          <ActivityFeed transactions={transactions} tasks={tasks} approvals={approvals} payments={payments} limit={8} />
         </div>
       </div>
 

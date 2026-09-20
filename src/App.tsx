@@ -4,7 +4,8 @@ import { Header } from './components/Header';
 import { Footer } from './components/Footer';
 import { HomeView } from './views/HomeView';
 import { AgentsView } from './views/AgentsView';
-import { RulesView } from './views/RulesView';
+import { AppsView } from './views/AppsView';
+import { OrdersView } from './views/OrdersView';
 import { ActivityView } from './views/ActivityView';
 import { AuditView } from './views/AuditView';
 import { PreferencesView } from './views/PreferencesView';
@@ -328,6 +329,18 @@ export default function App() {
     }
   };
 
+  // Demo 5 — replay protection: re-executing a SUCCEEDED payment must 409.
+  // Returns the backend's rejection message for display; never masks errors.
+  const handleVerifyReplay = async (payment: MockPaymentItem): Promise<string> => {
+    try {
+      await api.executeMockPayment(payment.id);
+      await refreshData();
+      return 'Payment executed again — this should not happen; please report it.';
+    } catch (e: unknown) {
+      return e instanceof Error ? e.message : 'Replay rejected by the backend.';
+    }
+  };
+
   // Step 1 of explicit domain setup: create the agent (confirmed in dialog,
   // including its backend domain and the category the rule will cover).
   // Step 2 opens the normal rule form prefilled — the rule is a separate
@@ -412,6 +425,7 @@ export default function App() {
             onCancelTask={handleCancelTask}
             onPayTask={handlePayTask}
             onRetryPayment={handleRetryPayment}
+            onVerifyReplay={handleVerifyReplay}
             onRevokeAgent={handleRevokeAgent}
             onSetupDomain={setSetupDomainId}
             notify={showToast}
@@ -426,33 +440,46 @@ export default function App() {
             transactions={transactions}
             onOpenRegister={() => setIsRegisterAgentOpen(true)}
             onRevokeAgent={handleRevokeAgent}
-          />
-        )}
-
-        {activeTab === 'rules' && (
-          <RulesView
-            agents={agents}
-            mandates={mandates}
-            delegations={delegations}
-            transactions={transactions}
             onOpenCreateMandate={() => {
               setMandateInitial(null);
               setIsCreateMandateOpen(true);
             }}
-            onOpenCreateDelegation={() => setIsCreateDelegationOpen(true)}
-            onEditLimit={(m) => setEditLimitTarget(m)}
-            onToggleMandate={handleToggleMandate}
-            onRevokeDelegation={handleRevokeDelegation}
             onAddRuleForAgent={(agentId) => {
               setMandateInitial({ agentId });
               setIsCreateMandateOpen(true);
             }}
+            onEditLimit={(m) => setEditLimitTarget(m)}
+            onToggleMandate={handleToggleMandate}
+            onOpenCreateDelegation={() => setIsCreateDelegationOpen(true)}
+            onRevokeDelegation={handleRevokeDelegation}
+          />
+        )}
+
+        {activeTab === 'apps' && (
+          <AppsView
+            agents={agents}
+            mandates={mandates}
+            onCreateMandate={handleCreateMandate}
+            onEditLimit={(m) => setEditLimitTarget(m)}
+            onToggleMandate={handleToggleMandate}
+          />
+        )}
+
+        {activeTab === 'orders' && (
+          <OrdersView
+            tasks={tasks}
+            payments={payments}
+            transactions={transactions}
+            agents={agents}
+            approvals={approvals}
+            onNavigate={setActiveTab}
           />
         )}
 
         {activeTab === 'activity' && (
           <ActivityView
             agents={agents}
+            mandates={mandates}
             transactions={transactions}
             tasks={tasks}
             approvals={approvals}
@@ -475,7 +502,7 @@ export default function App() {
 
       {/* Shared transaction detail for Home (Activity has its own drawer) */}
       {activeTab === 'home' && selectedTx && (
-        <TransactionDetailModal tx={selectedTx} onClose={() => setSelectedTx(null)} />
+        <TransactionDetailModal tx={selectedTx} agents={agents} mandates={mandates} onClose={() => setSelectedTx(null)} />
       )}
 
       {setupDomainId && (

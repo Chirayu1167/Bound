@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { DelegationChain, ProvenanceEvent, TransactionRecord } from '../types';
+import { AgentNode, DelegationChain, MandateItem, ProvenanceEvent, TransactionRecord } from '../types';
 import * as api from '../services/api';
 import { DecisionBadge, Modal, RiskBadge, TechnicalDetails, TechRow, riskExplanation } from './ui';
+import { WhyPanel } from './WhyPanel';
 
-export const TransactionDetailModal: React.FC<{ tx: TransactionRecord; onClose: () => void }> = ({ tx, onClose }) => {
+export const TransactionDetailModal: React.FC<{ tx: TransactionRecord; agents: AgentNode[]; mandates: MandateItem[]; onClose: () => void }> = ({ tx, agents, mandates, onClose }) => {
   const [events, setEvents] = useState<ProvenanceEvent[]>([]);
   const [chain, setChain] = useState<DelegationChain | null>(null);
 
@@ -24,6 +25,8 @@ export const TransactionDetailModal: React.FC<{ tx: TransactionRecord; onClose: 
   }, [tx.id, tx.agent_id]);
 
   const factors = tx.risk_factors?.slice(0, 3) || [];
+  const agent = agents.find((a) => a.id === tx.agent_id) || null;
+  const mandate = mandates.find((m) => m.id === tx.mandate_id) || null;
 
   return (
     <Modal onClose={onClose} maxWidth="max-w-xl">
@@ -39,12 +42,21 @@ export const TransactionDetailModal: React.FC<{ tx: TransactionRecord; onClose: 
         <button onClick={onClose} className="px-2.5 py-1.5 rounded-lg bg-[#eef1f6] text-[13px] hover:bg-[#e2e7f0] cursor-pointer shrink-0">Close</button>
       </div>
 
-      {tx.decision !== 'ALLOW' && (
-        <div className="mt-4 rounded-lg bg-[#fdf3f2] border border-[#e8c4c0] px-3 py-2.5">
-          <p className="text-[12px] font-medium text-[#93000a]">Why this needs review</p>
-          <p className="text-[13px] text-[#0b1c30] mt-0.5">{tx.reason || 'This payment was outside the allowed rule.'}</p>
-        </div>
-      )}
+      <div className="mt-4">
+        <WhyPanel
+          agentName={tx.agent}
+          agentActive={!agent || agent.status === 'ACTIVE'}
+          cap={mandate ? mandate.max_amount : null}
+          ruleCategory={mandate ? mandate.merchant_category : null}
+          rulePurpose={mandate ? mandate.purpose : null}
+          requestedAmount={tx.rawAmount}
+          merchant={tx.merchant}
+          category={tx.merchant_category}
+          purpose={tx.purpose}
+          approved={tx.decision === 'ALLOW'}
+          reason={tx.reason}
+        />
+      </div>
 
       <div className="mt-4">
         <p className="text-[12px] font-medium text-[#76777d] uppercase tracking-wide">Risk</p>
@@ -91,7 +103,7 @@ export const TransactionDetailModal: React.FC<{ tx: TransactionRecord; onClose: 
       </div>
 
       <div className="mt-4">
-        <TechnicalDetails summary="Advanced — technical details">
+        <TechnicalDetails summary="View technical proof">
           <TechRow k="Transaction ID" v={tx.id} />
           <TechRow k="Agent ID" v={tx.agent_id} />
           <TechRow k="Mandate ID" v={tx.mandate_id || '—'} />
