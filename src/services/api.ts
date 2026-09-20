@@ -566,6 +566,48 @@ export async function getMockPayments(taskId?: string): Promise<MockPaymentItem[
 }
 
 // ---------------------------------------------------------------------------
+// Demo wallet — backend-owned simulated funds (never hardcoded in UI)
+// ---------------------------------------------------------------------------
+export interface WalletInfo {
+  balance: number;
+  currency: string;
+  total_credited: number;
+  total_debited: number;
+  transaction_count: number;
+  updated_at: string | null;
+}
+
+export interface WalletTx {
+  id: string;
+  direction: 'DEBIT' | 'CREDIT';
+  kind: string;
+  amount: number;
+  currency: string;
+  balance_after: number;
+  merchant: string | null;
+  agent_id: string | null;
+  task_id: string | null;
+  payment_id: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export async function getWallet(): Promise<WalletInfo> {
+  return apiFetch<WalletInfo>('/wallet');
+}
+
+export async function getWalletTransactions(limit = 50): Promise<WalletTx[]> {
+  return apiFetch<WalletTx[]>(`/wallet/transactions?limit=${limit}`);
+}
+
+export async function topupWallet(amount: number): Promise<WalletInfo> {
+  return apiFetch<WalletInfo>('/wallet/topup', {
+    method: 'POST',
+    body: JSON.stringify({ amount }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Optional LLM intent assist — Groq behind the backend (key never in browser)
 // ---------------------------------------------------------------------------
 export interface InterpretResult {

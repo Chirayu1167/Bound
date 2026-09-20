@@ -19,14 +19,13 @@ import { TaskResultCard } from '../components/TaskResultCard';
 import { ApprovalCard } from '../components/ApprovalCard';
 import { PaymentScreen } from '../components/PaymentScreen';
 import { ActivityFeed } from '../components/ActivityFeed';
-import { DemoScenarios } from '../components/DemoScenarios';
 import { DEMO_APPS, connectionsForApps } from '../apps';
-import { executeMockPayment, interpretRequest } from '../services/api';
+import { executeMockPayment, interpretRequest, type WalletInfo, type WalletTx } from '../services/api';
 import { FlowSteps, type FlowStage } from '../components/FlowSteps';
 import { ConversationCard, type ConversationState } from '../components/ConversationCard';
 import type { TaskAuthorizeResult } from '../services/api';
 
-interface HomeViewProps {
+interface WalletViewProps {
   agents: AgentNode[];
   mandates: MandateItem[];
   transactions: TransactionRecord[];
@@ -34,6 +33,9 @@ interface HomeViewProps {
   approvals: ApprovalItem[];
   payments: MockPaymentItem[];
   backendLive: boolean | null;
+  wallet: WalletInfo | null;
+  walletTxns: WalletTx[];
+  askPreset: { text: string; nonce: number } | null;
   onNavigate: (tab: ActiveTab) => void;
   onSelectTransaction: (tx: TransactionRecord) => void;
   onCheckTask: (input: TaskCheckInput) => Promise<TaskAuthorizeResult>;
@@ -46,6 +48,7 @@ interface HomeViewProps {
   onSetupDomain: (domainId: DomainId) => void;
   notify: (msg: string) => void;
   onVerifyReplay?: (payment: MockPaymentItem) => Promise<string>;
+  onTopup: (amount: number) => Promise<void>;
 }
 
 interface DraftState {
@@ -70,7 +73,7 @@ function isLiveTask(t: TaskItem, now: number): boolean {
   return true;
 }
 
-export const HomeView: React.FC<HomeViewProps> = ({
+export const WalletView: React.FC<WalletViewProps> = ({
   agents,
   mandates,
   transactions,
@@ -78,6 +81,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
   approvals,
   payments,
   backendLive,
+  wallet,
+  walletTxns,
+  askPreset,
   onNavigate,
   onSelectTransaction,
   onCheckTask,
@@ -90,6 +96,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onSetupDomain,
   notify,
   onVerifyReplay,
+  onTopup,
 }) => {
   const [draftState, setDraftState] = useState<DraftState | null>(null);
   const [notUnderstood, setNotUnderstood] = useState<string | null>(null);
@@ -104,16 +111,34 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [payment, setPayment] = useState<MockPaymentItem | null>(null);
   const [payBusy, setPayBusy] = useState(false);
   const [payError, setPayError] = useState<string | null>(null);
-  const [askPreset, setAskPreset] = useState<{ text: string; nonce: number } | null>(null);
+  const [topupOpen, setTopupOpen] = useState(false);
+  const [topupAmount, setTopupAmount] = useState('5000');
+  const [topupBusy, setTopupBusy] = useState(false);
+  const [topupError, setTopupError] = useState<string | null>(null);
   // Phase 5: in-memory session context only. Nothing here is persisted and
   // nothing here authorizes — it only pre-fills what the user then confirms.
   const [session, setSession] = useState<SessionContext>(emptySession);
   const [conversation, setConversation] = useState<ConversationState | null>(null);
   const [pendingRefAsk, setPendingRefAsk] = useState<string | null>(null);
 
-  const handleFillAsk = (text: string) => {
-    setAskPreset({ text, nonce: Date.now() });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+  const handleTopup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTopupError(null);
+    const amount = parseFloat(topupAmount);
+    if (!amount || amount <= 0) {
+      setTopupError('Enter an amount greater than zero.');
+      return;
+    }
+    setTopupBusy(true);
+    try {
+      await onTopup(amount);
+      setTopupOpen(false);
+      notify(`Added ₹${amount.toLocaleString()} in demo funds.`);
+    } catch (err: unknown) {
+      setTopupError(err instanceof Error ? err.message : 'Top-up failed.');
+    } finally {
+      setTopupBusy(false);
+    }
   };
 
   const touchSession = (patch: Partial<SessionContext>) => {
@@ -565,6 +590,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
         riskFactors={riskFactorsForTask(task)}
         busy={actionBusy}
         actionError={actionError}
+        walletBalance={wallet?.balance ?? null}
         onApprove={(a) => runAction(() => onApprove(a), 'Approved once — your rule is unchanged.')}
         onDeny={(a) => runAction(() => onDeny(a), 'Denied.')}
         onCancelTask={(t) => setConfirmCancel(t)}
@@ -574,7 +600,6 @@ export const HomeView: React.FC<HomeViewProps> = ({
     );
   };
 
-  const foodAgent = resolutions.get('food')?.agent || null;
   const waitingCount =
     tasks.filter((t) => t.status === 'NEEDS_REVIEW' && approvalByTask.get(t.id)?.status === 'PENDING').length +
     orphanReview.length;
@@ -625,6 +650,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
         onNewRequest={closePayment}
         onViewActivity={() => onNavigate('activity')}
         onVerifyReplay={activePayment?.status === 'SUCCEEDED' ? () => handleVerifyReplay(activePayment) : undefined}
+        walletBalance={wallet?.balance ?? null}
         onBack={() => {
           setPayingTaskId(null);
           setPayment(null);
@@ -636,22 +662,77 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
   return (
     <div className="space-y-5">
-      {/* 1. Status — answers "is anything waiting for me?" from real data only */}
-      <div className="rounded-xl bg-white border border-[#e2e3e8] px-4 py-3 flex items-center gap-4 flex-wrap">
-        <span className="flex items-center gap-1.5 text-[13px] text-[#0b1c30]">
-          <span
-            className={`w-2 h-2 rounded-full ${backendLive === false ? 'bg-[#ba1a1a]' : backendLive === true ? 'bg-[#0a6b4a]' : 'bg-[#9a9ba1]'}`}
-          />
-          {backendLive === null ? 'Checking backend…' : backendLive ? 'Connected' : 'Offline'}
-        </span>
-        <span className="text-[#e2e3e8]">|</span>
-        <span className={`text-[13px] font-medium ${waitingCount > 0 ? 'text-[#93000a]' : 'text-[#0a6b4a]'}`}>
-          {waitingCount === 0 ? 'Nothing waiting for review' : `${waitingCount} waiting for review`}
-        </span>
-        <span className="text-[#e2e3e8]">|</span>
-        <span className="text-[13px] text-[#5a5c63]">
-          {liveTasks.length === 0 ? 'No live tasks' : `${liveTasks.length} live task${liveTasks.length === 1 ? '' : 's'}`}
-        </span>
+      {/* 1. Wallet hero — backend-owned balance, never hardcoded */}
+      <div className="rounded-xl bg-[#0b1c30] text-white px-5 py-5">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <p className="text-[12px] font-medium uppercase tracking-wide text-white/70">Bound Wallet · Demo Wallet</p>
+            <p className="text-[34px] font-semibold tracking-tight mt-1">
+              {wallet ? `₹${wallet.balance.toLocaleString()}` : '…'}
+            </p>
+            <p className="text-[12px] text-white/70 mt-0.5">
+              {wallet ? `Available · Total spent ₹${wallet.total_debited.toLocaleString()}` : 'Loading balance from the backend…'}
+            </p>
+            <p className="text-[11px] text-white/50 mt-1">Payments are simulated for this demo.</p>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[12px] border ${backendLive === false ? 'bg-[#fdecea] text-[#93000a] border-[#ba1a1a]/25' : backendLive ? 'bg-[#e6f4ee] text-[#0a6b4a] border-[#0a6b4a]/20' : 'bg-white/10 text-white/80 border-white/20'}`}>
+              {backendLive === null ? 'Connecting…' : backendLive ? 'Connected' : 'Offline'}
+            </span>
+            {!topupOpen ? (
+              <button onClick={() => setTopupOpen(true)} className="px-3.5 py-2 rounded-lg bg-white text-[#0b1c30] text-[13px] font-medium hover:opacity-90 cursor-pointer">
+                Add demo funds
+              </button>
+            ) : (
+              <form onSubmit={handleTopup} className="flex items-center gap-1.5">
+                <input
+                  type="number" min="1" max="100000" step="any" value={topupAmount}
+                  onChange={(e) => setTopupAmount(e.target.value)} aria-label="Top-up amount"
+                  className="w-24 px-2.5 py-2 rounded-lg text-[13px] text-[#0b1c30] outline-none"
+                />
+                <button type="submit" disabled={topupBusy} className="px-3 py-2 rounded-lg bg-white text-[#0b1c30] text-[13px] font-medium hover:opacity-90 cursor-pointer disabled:opacity-60">
+                  {topupBusy ? '…' : 'Add'}
+                </button>
+                <button type="button" onClick={() => { setTopupOpen(false); setTopupError(null); }} className="px-2 py-2 rounded-lg text-[13px] text-white/70 hover:text-white cursor-pointer">
+                  ✕
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+        {topupError && <p className="text-[13px] text-[#ffb4ab] mt-2">{topupError}</p>}
+
+        <div className="mt-4 pt-4 border-t border-white/15">
+          <p className="text-[12px] font-medium uppercase tracking-wide text-white/70">Recent transactions</p>
+          {walletTxns.filter((w) => w.kind !== 'INITIAL').length === 0 ? (
+            <p className="text-[13px] text-white/70 mt-1.5">No transactions yet</p>
+          ) : (
+            <ul className="mt-2 divide-y divide-white/10">
+              {walletTxns.filter((w) => w.kind !== 'INITIAL').slice(0, 5).map((w) => (
+                <li key={w.id} className="py-2 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[13px] truncate">
+                      <span className={`font-semibold ${w.direction === 'DEBIT' ? 'text-[#ffb4ab]' : 'text-[#7fd6a8]'}`}>
+                        {w.direction === 'DEBIT' ? '−' : '+'}₹{w.amount.toLocaleString()}
+                      </span>
+                      <span className="text-white/70"> · {w.merchant || (w.kind === 'TOPUP' ? 'Demo funds' : w.kind === 'INITIAL' ? 'Initial demo funds' : 'Wallet')}</span>
+                    </p>
+                    <p className="text-[11px] text-white/50 truncate">
+                      {w.created_at ? new Date(w.created_at).toLocaleString() : ''}
+                    </p>
+                  </div>
+                  <p className="text-[12px] text-white/70 shrink-0">Balance ₹{w.balance_after.toLocaleString()}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {agents.length === 0 && tasks.length === 0 && (
+          <button onClick={() => onNavigate('agents')} className="mt-4 w-full px-4 py-2.5 rounded-lg bg-white/10 border border-white/20 text-white text-[13px] font-medium hover:bg-white/15 cursor-pointer">
+            Create your first agent →
+          </button>
+        )}
       </div>
 
       {/* 2. Needs attention: real pending approvals first, other review items after */}
@@ -767,9 +848,6 @@ export const HomeView: React.FC<HomeViewProps> = ({
           if (!task || task.status !== 'APPROVED') return null;
           return renderPaymentScreen(task);
         })()}
-
-      {/* 4. Demo scenarios — guided, real-engine tours */}
-      <DemoScenarios onFillAsk={handleFillAsk} foodAgent={foodAgent} onRevokeAgent={onRevokeAgent} />
 
       {/* Live tasks */}
       {otherTasks.length > 0 && (

@@ -20,6 +20,8 @@ interface TaskResultCardProps {
   onDismiss?: () => void;
   /** When provided, APPROVED tasks show a Continue-to-payment button. */
   onPay?: (task: TaskItem) => void;
+  /** Fresh backend wallet balance for the review screen (null while unknown). */
+  walletBalance?: number | null;
 }
 
 /**
@@ -46,9 +48,11 @@ export const TaskResultCard: React.FC<TaskResultCardProps> = ({
   onCancelTask,
   onDismiss,
   onPay,
+  walletBalance = null,
 }) => {
   const approved = task.status === 'APPROVED';
   const authOk = task.authorization_status === 'ALLOW';
+  const afterPayment = walletBalance != null ? walletBalance - task.requested_amount : null;
 
   return (
     <div className={`rounded-xl bg-white border p-5 ${approved ? 'border-[#0a6b4a]/30' : 'border-[#e8c4c0]'}`}>
@@ -152,6 +156,21 @@ export const TaskResultCard: React.FC<TaskResultCardProps> = ({
           )}
 
           {actionError && <p className="text-[13px] text-[#93000a]">{actionError}</p>}
+
+          {walletBalance != null && (
+            <div className="rounded-lg bg-[#f7f8fb] border border-[#eef0f4] px-3 py-2.5 text-[13px]">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[#5a5c63]">Wallet</span>
+                <span className="font-medium text-[#0b1c30]">₹{walletBalance.toLocaleString()}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 mt-0.5">
+                <span className="text-[#5a5c63]">After payment</span>
+                <span className={`font-semibold ${afterPayment != null && afterPayment < 0 ? 'text-[#93000a]' : 'text-[#0b1c30]'}`}>
+                  {afterPayment == null ? '—' : afterPayment < 0 ? 'Insufficient balance' : `₹${afterPayment.toLocaleString()}`}
+                </span>
+              </div>
+            </div>
+          )}
 
           {approval && approval.status === 'PENDING' ? (
             <div className="mt-1 flex items-center gap-2 flex-wrap">

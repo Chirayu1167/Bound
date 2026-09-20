@@ -1,11 +1,17 @@
 import React from 'react';
 import { DOMAINS } from '../domains';
 import { usualSpendRange, formatUsualSpend } from '../preferences';
-import type { TransactionRecord } from '../types';
-import { EmptyState } from '../components/ui';
+import type { AgentNode, TransactionRecord } from '../types';
+import { EmptyState, TechnicalDetails } from '../components/ui';
+import { DemoScenarios } from '../components/DemoScenarios';
 
 interface PreferencesViewProps {
   transactions: TransactionRecord[];
+  /** Resolved Food agent for the revocation demo (null when not set up). */
+  foodAgent: AgentNode | null;
+  onRevokeAgent: (agentId: string) => Promise<void>;
+  /** Guided demo buttons fill the Wallet ask bar and switch to it. */
+  onFillAsk: (text: string) => void;
 }
 
 /**
@@ -19,11 +25,11 @@ interface PreferencesViewProps {
  * Invariant, stated in the UI: preferences inform behavior and risk
  * detection; they never grant permission.
  */
-export const PreferencesView: React.FC<PreferencesViewProps> = ({ transactions }) => {
+export const PreferencesView: React.FC<PreferencesViewProps> = ({ transactions, foodAgent, onRevokeAgent, onFillAsk }) => {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-[22px] font-semibold text-[#0b1c30] tracking-tight">Preferences</h1>
+        <h1 className="text-[22px] font-semibold text-[#0b1c30] tracking-tight">Settings</h1>
         <p className="text-[13px] text-[#5a5c63] mt-1 max-w-xl">
           What Bound knows about your habits — used to spot unusual activity.
           Preferences never grant permission: only your spending rules do.
@@ -58,6 +64,12 @@ export const PreferencesView: React.FC<PreferencesViewProps> = ({ transactions }
         title="Full preferences arrive in Phase 2"
         body="Vegetarian, favorite restaurants, usual ranges, preferred airline, delivery addresses — stored per user, editable here, and used only for behavior context and risk signals. They will never raise a spending limit."
       />
+
+      <TechnicalDetails summary="Developer demos — guided tours of the real engine">
+        <div className="pt-1">
+          <DemoScenarios onFillAsk={onFillAsk} foodAgent={foodAgent} onRevokeAgent={onRevokeAgent} />
+        </div>
+      </TechnicalDetails>
     </div>
   );
 };

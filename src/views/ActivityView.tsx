@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AgentNode, ApprovalItem, DelegationChain, MandateItem, MockPaymentItem, ProvenanceEvent, TaskItem, TransactionRecord } from '../types';
 import * as api from '../services/api';
+import type { WalletTx } from '../services/api';
 import { DecisionBadge, EmptyState, RiskBadge, TechnicalDetails, TechRow, riskExplanation } from '../components/ui';
 import { WhyPanel } from '../components/WhyPanel';
 
 interface ActivityViewProps {
   agents: AgentNode[];
   mandates: MandateItem[];
+  walletTxns: WalletTx[];
   transactions: TransactionRecord[];
   tasks: TaskItem[];
   approvals: ApprovalItem[];
@@ -24,7 +26,7 @@ function topFactors(tx: TransactionRecord): TransactionRecord['risk_factors'] {
   return tx.risk_factors.slice(0, 3);
 }
 
-export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, transactions, tasks, approvals, payments, selected, onSelect, onAuthorize, onRefresh }) => {
+export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, walletTxns, transactions, tasks, approvals, payments, selected, onSelect, onAuthorize, onRefresh }) => {
   const [filter, setFilter] = useState<'all' | 'approved' | 'review'>('all');
   const [agentId, setAgentId] = useState(agents[0]?.id || '');
   const [amount, setAmount] = useState('800');
@@ -57,6 +59,13 @@ export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, tr
     }
     return m;
   }, [payments]);
+  const balanceByPayment = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const w of walletTxns) {
+      if (w.payment_id) m.set(w.payment_id, w.balance_after);
+    }
+    return m;
+  }, [walletTxns]);
 
   const filtered = useMemo(() => {
     if (filter === 'approved') return transactions.filter((t) => t.decision === 'ALLOW');
@@ -181,14 +190,17 @@ export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, tr
       ) : (
         <div className="rounded-xl bg-white border border-[#e2e3e8] overflow-hidden">
           <ul className="divide-y divide-[#eef0f4]">
-            {filtered.map((t) => (
+            {filtered.map((t) => {
+              const pay = paymentByTx.get(t.id);
+              const bal = pay ? balanceByPayment.get(pay.id) : undefined;
+              return (
               <li key={t.id}>
                 <button onClick={() => onSelect(t)} className="w-full text-left px-4 py-3.5 hover:bg-[#f7f8fb] cursor-pointer flex items-center justify-between gap-3">
                   <div className="min-w-0">
                     <p className="text-[13px] text-[#0b1c30]">
                       <span className="font-semibold">{t.amount}</span> · {t.merchant} <span className="text-[#76777d]">· {t.merchant_category}</span>
                     </p>
-                    <p className="text-[12px] text-[#76777d] mt-0.5 truncate">{t.agent} · {t.timestamp}{t.reason && t.decision !== 'ALLOW' ? ` · Why? ${t.reason}` : ''}</p>
+                    <p className="text-[12px] text-[#76777d] mt-0.5 truncate">{t.agent} · {t.timestamp}{t.reason && t.decision !== 'ALLOW' ? ` · Why? ${t.reason}` : ''}{bal != null ? ` · Balance ₹${bal.toLocaleString()}` : ''}</p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     {taskByTx.has(t.id) && (
@@ -202,7 +214,8 @@ export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, tr
                   </div>
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
         </div>
       )}
@@ -212,6 +225,10 @@ export const ActivityView: React.FC<ActivityViewProps> = ({ agents, mandates, tr
           tx={selected}
           agents={agents}
           mandates={mandates}
+          balanceAfter={(() => {
+            const pay = paymentByTx.get(selected.id);
+            return pay ? balanceByPayment.get(pay.id) ?? null : null;
+          })()}
           task={taskByTx.get(selected.id) || null}
           approval={(() => {
             const task = taskByTx.get(selected.id);
@@ -289,7 +306,7 @@ function LifecycleStrip({ tx, task, approval, payment }: { tx: TransactionRecord
   );
 }
 
-function TransactionDrawer({ tx, agents, mandates, task, approval, payment, onClose }: { tx: TransactionRecord; agents: AgentNode[]; mandates: MandateItem[]; task: TaskItem | null; approval: ApprovalItem | null; payment: MockPaymentItem | null; onClose: () => void }) {
+function TransactionDrawer({ tx, agents, mandates, balanceAfter, task, approval, payment, onClose }: { tx: TransactionRecord; agents: AgentNode[]; mandates: MandateItem[]; balanceAfter: number | null; task: TaskItem | null; approval: ApprovalItem | null; payment: MockPaymentItem | null; onClose: () => void }) {
   const [events, setEvents] = useState<ProvenanceEvent[]>([]);
   const [chain, setChain] = useState<DelegationChain | null>(null);
   const [loading, setLoading] = useState(true);
@@ -389,6 +406,9 @@ function TransactionDrawer({ tx, agents, mandates, task, approval, payment, onCl
                 </p>
                 {payment.note && <p className="text-[12px] text-[#5a5c63]">“{payment.note}”</p>}
                 {payment.failure_reason && <p className="text-[12px] text-[#93000a]">{payment.failure_reason}</p>}
+                {(payment.wallet_balance_after ?? balanceAfter) != null && (
+                  <p className="text-[12px] text-[#0b1c30]">Wallet balance after: <span className="font-medium">₹{((payment.wallet_balance_after ?? balanceAfter) as number).toLocaleString()}</span></p>
+                )}
                 <p className="text-[11px] text-[#76777d]">Simulated — no real funds transferred.</p>
               </div>
             </div>

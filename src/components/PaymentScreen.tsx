@@ -22,6 +22,8 @@ interface PaymentScreenProps {
   onBack: () => void;
   /** Re-attempts execution of the succeeded payment; resolves with the backend's rejection message (409). */
   onVerifyReplay?: () => Promise<string>;
+  /** Fresh backend wallet balance (null while unknown). Never hardcoded. */
+  walletBalance: number | null;
 }
 
 function riskLabel(level: string | null): string {
@@ -57,6 +59,7 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
   onViewActivity,
   onBack,
   onVerifyReplay,
+  walletBalance,
 }) => {
   const [method, setMethod] = useState('Demo Balance');
   const [note, setNote] = useState('');
@@ -77,6 +80,9 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
   const showProcessing = busy || payment?.status === 'PROCESSING' || payment?.status === 'CREATED';
   const succeeded = payment?.status === 'SUCCEEDED';
   const failed = payment?.status === 'FAILED';
+  const balanceAfter = walletBalance != null ? walletBalance - task.requested_amount : null;
+  const wouldOverdraw = walletBalance != null && walletBalance < task.requested_amount;
+  const insufficientHint = error && error.includes('INSUFFICIENT WALLET BALANCE');
 
   const microStage = succeeded || failed ? 3 : showProcessing ? 2 : 0;
   const microSteps = ['Details', 'Security', 'Pay', 'Receipt'];
@@ -136,6 +142,9 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           </p>
           {payment.note && <p className="text-[12px] text-[#5a5c63] mt-1">“{payment.note}”</p>}
           <p className="text-[12px] text-[#76777d] mt-2">Simulated payment — no real money moved.</p>
+          <p className="text-[13px] text-[#0b1c30] mt-1.5">
+            Wallet balance <span className="font-semibold">₹{(payment.wallet_balance_after ?? walletBalance ?? 0).toLocaleString()}</span>
+          </p>
           <p className="text-[12px] text-[#0a6b4a] mt-1 font-medium">Approval token: consumed — it cannot be reused.</p>
           {onVerifyReplay && (
             <div className="mt-3 w-full rounded-lg border border-[#e2e3e8] bg-[#fafbff] px-3 py-2.5 text-left">
@@ -153,7 +162,7 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
               New request
             </button>
             <button onClick={onViewActivity} className="flex-1 px-4 py-2 rounded-lg bg-[#eef1f6] text-[#0b1c30] text-[13px] font-medium hover:bg-[#e2e7f0] cursor-pointer">
-              View in Activity
+              View transaction
             </button>
           </div>
         </div>
@@ -182,6 +191,35 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
               {task.merchant} <span className="text-[#76777d]">· {task.category} · {task.purpose}</span>
             </p>
             <p className="text-[12px] text-[#76777d] mt-0.5">via {agentName}</p>
+          </div>
+
+          <div className="rounded-lg border border-[#e2e3e8] bg-white px-4 py-3">
+            <p className="text-[12px] font-medium text-[#76777d] uppercase tracking-wide">Demo wallet</p>
+            {walletBalance == null ? (
+              <p className="text-[13px] text-[#76777d] mt-1">Balance unknown — it will be checked by the backend before paying.</p>
+            ) : (
+              <dl className="mt-1.5 space-y-1 text-[13px]">
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-[#5a5c63]">Wallet balance</dt>
+                  <dd className="font-medium text-[#0b1c30]">₹{walletBalance.toLocaleString()}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-[#5a5c63]">Payment</dt>
+                  <dd className="font-medium text-[#0b1c30]">₹{task.requested_amount.toLocaleString()}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-[#5a5c63]">Balance after payment</dt>
+                  <dd className={`font-semibold ${wouldOverdraw ? 'text-[#93000a]' : 'text-[#0a6b4a]'}`}>
+                    {wouldOverdraw ? 'Insufficient' : `₹${(balanceAfter as number).toLocaleString()}`}
+                  </dd>
+                </div>
+              </dl>
+            )}
+            {wouldOverdraw && (
+              <p className="text-[12px] text-[#93000a] mt-1.5">
+                Authorized, but the wallet cannot cover this — the backend will refuse and debit nothing.
+              </p>
+            )}
           </div>
 
           <div className="rounded-lg border border-[#0a6b4a]/25 bg-[#f4faf7] px-3.5 py-2.5 space-y-1">
@@ -222,6 +260,11 @@ export const PaymentScreen: React.FC<PaymentScreenProps> = ({
           </div>
 
           {error && <p className="text-[13px] text-[#93000a]">{error}</p>}
+          {insufficientHint && (
+            <p className="text-[12px] text-[#5a5c63]">
+              The task stays approved — top up demo funds in Wallet, then pay again. Nothing was debited.
+            </p>
+          )}
 
           <div className="flex items-center gap-2">
             <button

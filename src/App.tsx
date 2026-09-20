@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { ActiveTab, AgentNode, ApprovalItem, DelegationItem, MandateItem, MockPaymentItem, TaskItem, TransactionRecord } from './types';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
-import { HomeView } from './views/HomeView';
+import { WalletView } from './views/WalletView';
 import { AgentsView } from './views/AgentsView';
 import { AppsView } from './views/AppsView';
 import { OrdersView } from './views/OrdersView';
@@ -20,7 +20,7 @@ import { DOMAINS, type DomainId } from './domains';
 import * as api from './services/api';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('home');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('wallet');
   const [agents, setAgents] = useState<AgentNode[]>([]);
   const [mandates, setMandates] = useState<MandateItem[]>([]);
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
@@ -36,6 +36,9 @@ export default function App() {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [payments, setPayments] = useState<MockPaymentItem[]>([]);
+  const [wallet, setWallet] = useState<api.WalletInfo | null>(null);
+  const [walletTxns, setWalletTxns] = useState<api.WalletTx[]>([]);
+  const [askPreset, setAskPreset] = useState<{ text: string; nonce: number } | null>(null);
   // Explicit domain setup: creating authority always needs user confirmation.
   const [setupDomainId, setSetupDomainId] = useState<DomainId | null>(null);
   const [mandateInitial, setMandateInitial] = useState<MandateInitialValues | null>(null);
@@ -48,6 +51,16 @@ export default function App() {
       setToastMessage((current) => (current === msg ? null : current));
     }, 3500);
   };
+
+  const refreshWallet = useCallback(async () => {
+    try {
+      const [w, txns] = await Promise.all([api.getWallet(), api.getWalletTransactions(50)]);
+      setWallet(w);
+      setWalletTxns(txns);
+    } catch (e) {
+      console.error('[App] wallet refresh failed', e);
+    }
+  }, []);
 
   const refreshData = useCallback(async (): Promise<boolean> => {
     try {
@@ -67,6 +80,8 @@ export default function App() {
       setTasks(tk);
       setApprovals(ap);
       setPayments(pay);
+      // Wallet is backend-owned state too, but never blocks the rest.
+      await refreshWallet();
       // Core live endpoints succeeded, so the backend is demonstrably reachable.
       // This corrects a stale Offline latch from an earlier cold-start health probe.
       setBackendLive(true);
@@ -76,7 +91,7 @@ export default function App() {
       showToast('Could not load data from the backend.');
       return false;
     }
-  }, []);
+  }, [refreshWallet]);
 
   // One-time approval tokens live in localStorage (per browser session).
   // The backend stores only hashes and returns each token exactly once.
@@ -302,6 +317,22 @@ export default function App() {
     }
   };
 
+  const handleTopup = async (amount: number) => {
+    try {
+      await api.topupWallet(amount);
+      await refreshWallet();
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? `Top-up failed: ${e.message}` : 'Top-up failed.');
+      throw e;
+    }
+  };
+
+  // Demo shortcuts (Settings) fill the Wallet ask bar and take you there.
+  const handleFillAsk = (text: string) => {
+    setAskPreset({ text, nonce: Date.now() });
+    setActiveTab('wallet');
+  };
+
   // Demo payment: create + execute back-to-back. The backend gates both
   // steps on task APPROVED + fresh + agent ACTIVE; the UI only displays.
   const handlePayTask = async (task: TaskItem, method: string, note: string) => {
@@ -408,8 +439,8 @@ export default function App() {
       <Header activeTab={activeTab} onTabChange={setActiveTab} backendLive={backendLive} />
 
       <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-20 pb-12">
-        {activeTab === 'home' && (
-          <HomeView
+        {activeTab === 'wallet' && (
+          <WalletView
             agents={agents}
             mandates={mandates}
             transactions={transactions}
@@ -417,6 +448,9 @@ export default function App() {
             approvals={approvals}
             payments={payments}
             backendLive={backendLive}
+            wallet={wallet}
+            walletTxns={walletTxns}
+            askPreset={askPreset}
             onNavigate={setActiveTab}
             onSelectTransaction={setSelectedTx}
             onCheckTask={handleCheckTask}
@@ -429,6 +463,7 @@ export default function App() {
             onRevokeAgent={handleRevokeAgent}
             onSetupDomain={setSetupDomainId}
             notify={showToast}
+            onTopup={handleTopup}
           />
         )}
 
@@ -472,6 +507,7 @@ export default function App() {
             transactions={transactions}
             agents={agents}
             approvals={approvals}
+            walletTxns={walletTxns}
             onNavigate={setActiveTab}
           />
         )}
@@ -480,6 +516,7 @@ export default function App() {
           <ActivityView
             agents={agents}
             mandates={mandates}
+            walletTxns={walletTxns}
             transactions={transactions}
             tasks={tasks}
             approvals={approvals}
@@ -495,13 +532,20 @@ export default function App() {
 
         {activeTab === 'audit' && <AuditView transactions={transactions} />}
 
-        {activeTab === 'preferences' && <PreferencesView transactions={transactions} />}
+        {activeTab === 'preferences' && (
+          <PreferencesView
+            transactions={transactions}
+            foodAgent={agents.find((a) => a.domain === 'FOOD' && a.status === 'ACTIVE' && !a.is_task_agent) || null}
+            onRevokeAgent={handleRevokeAgent}
+            onFillAsk={handleFillAsk}
+          />
+        )}
       </main>
 
       <Footer />
 
-      {/* Shared transaction detail for Home (Activity has its own drawer) */}
-      {activeTab === 'home' && selectedTx && (
+      {/* Shared transaction detail for Wallet (Activity has its own drawer) */}
+      {activeTab === 'wallet' && selectedTx && (
         <TransactionDetailModal tx={selectedTx} agents={agents} mandates={mandates} onClose={() => setSelectedTx(null)} />
       )}
 

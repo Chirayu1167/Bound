@@ -102,7 +102,7 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-[22px] font-semibold text-[#0b1c30] tracking-tight">Agents</h1>
-          <p className="text-[13px] text-[#5a5c63] mt-1 max-w-xl">Each agent acts within a spending rule. Revoking an agent stops it from making new payments.</p>
+          <p className="text-[13px] text-[#5a5c63] mt-1 max-w-xl">Give AI agents limited authority to act on your behalf. A rule never gives an agent access to all your money — only its own bounded slice.</p>
         </div>
         <PrimaryButton onClick={onOpenRegister}>New agent</PrimaryButton>
       </div>
@@ -110,8 +110,8 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
       {visibleAgents.length === 0 ? (
         <EmptyState
           title="No agents yet"
-          body="Register your first agent, then give it a spending rule so it can act."
-          action={<PrimaryButton onClick={onOpenRegister}>Register agent</PrimaryButton>}
+          body="Create your first agent, then give it a spending rule: a purpose, a per-order limit, and an allowed category. Until then nothing can spend."
+          action={<PrimaryButton onClick={onOpenRegister}>Create agent</PrimaryButton>}
         />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">

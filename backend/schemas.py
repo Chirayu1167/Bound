@@ -393,6 +393,8 @@ class MockPaymentResponse(BaseModel):
     failure_reason: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
+    # Demo-wallet balance after this payment debited, None until SUCCEEDED.
+    wallet_balance_after: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -440,3 +442,54 @@ class AiInterpretResponse(BaseModel):
     explanation: Optional[str] = None
     groq: bool = False
     signals: Optional[list] = None
+
+
+# ---------------------------------------------------------------------------
+# Demo wallet — backend-owned simulated funds (NOT a bank account)
+# ---------------------------------------------------------------------------
+class WalletResponse(BaseModel):
+    balance: float
+    currency: str
+    total_credited: float
+    total_debited: float
+    transaction_count: int
+    updated_at: Optional[datetime] = None
+
+
+class WalletTransactionResponse(BaseModel):
+    id: str
+    direction: str
+    kind: str
+    amount: float
+    currency: str
+    balance_after: float
+    merchant: Optional[str] = None
+    agent_id: Optional[str] = None
+    task_id: Optional[str] = None
+    payment_id: Optional[str] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WalletTopupRequest(BaseModel):
+    amount: float = Field(..., gt=0, le=100000, example=5000)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def check_topup_amount(cls, v: Any):
+        try:
+            amount = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("amount must be a number")
+        if not (0 < amount <= 100000):
+            raise ValueError("amount must be between 1 and 100000")
+        return round(amount, 2)
+
+
+class DemoResetResponse(BaseModel):
+    reset: bool
+    deleted: dict
+    wallet: WalletResponse

@@ -182,3 +182,42 @@ class MockPayment(Base):
     failure_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Wallet(Base):
+    """Demo wallet — backend-owned simulated funds (NOT a bank account).
+
+    Singleton row (id "demo"). The frontend must never hardcode the balance;
+    every number comes from GET /wallet. Payments debit atomically inside
+    execute_mock_payment; top-ups credit via POST /wallet/topup.
+    """
+
+    __tablename__ = "wallet"
+
+    id = Column(String, primary_key=True, index=True)  # always "demo"
+    balance = Column(Float, nullable=False, default=10000)
+    currency = Column(String, nullable=False, default="INR")
+    total_credited = Column(Float, nullable=False, default=0)
+    total_debited = Column(Float, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class WalletTransaction(Base):
+    """Append-only demo-wallet ledger. Every debit/credit writes exactly one
+    row with the resulting balance_after, so history and balance always agree.
+    """
+
+    __tablename__ = "wallet_transactions"
+
+    id = Column(String, primary_key=True, index=True)  # wtx-xxx
+    direction = Column(String, nullable=False, index=True)  # DEBIT | CREDIT
+    kind = Column(String, nullable=False, default="PAYMENT")  # PAYMENT | TOPUP | INITIAL
+    amount = Column(Float, nullable=False)
+    currency = Column(String, nullable=False, default="INR")
+    balance_after = Column(Float, nullable=False)
+    merchant = Column(String, nullable=True)
+    agent_id = Column(String, nullable=True, index=True)  # No FK — allow revoked/missing for audit
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+    payment_id = Column(String, ForeignKey("mock_payments.id"), nullable=True, index=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

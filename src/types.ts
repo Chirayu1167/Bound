@@ -1,4 +1,4 @@
-export type ActiveTab = 'home' | 'agents' | 'apps' | 'orders' | 'activity' | 'audit' | 'preferences';
+export type ActiveTab = 'wallet' | 'agents' | 'apps' | 'orders' | 'activity' | 'audit' | 'preferences';
 
 export type AgentDomain = 'FOOD' | 'TRAVEL' | 'SHOPPING' | 'OTHER';
 
@@ -32,6 +32,8 @@ export interface MockPaymentItem {
   failure_reason: string | null;
   created_at: string;
   completed_at: string | null;
+  /** Demo-wallet balance after this payment debited; null until SUCCEEDED. */
+  wallet_balance_after: number | null;
 }
 
 export interface TaskItem {

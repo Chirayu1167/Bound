@@ -45,7 +45,8 @@ export const AppsView: React.FC<AppsViewProps> = ({ agents, mandates, onCreateMa
         <h1 className="text-[22px] font-semibold text-[#0b1c30] tracking-tight">Apps</h1>
         <p className="text-[13px] text-[#5a5c63] mt-1 max-w-xl">
           Services your agents can use. {connectedCount} of {DEMO_APPS.length} connected. Integrations below are
-          simulated demos — connecting one creates a real spending rule that Bound enforces.
+          simulated demos — connecting one creates a real spending rule that Bound enforces, and payment
+          execution uses the Bound Demo Wallet.
         </p>
       </div>
 

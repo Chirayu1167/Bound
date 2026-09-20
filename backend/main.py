@@ -897,205 +897,18 @@ def _handle_idempotent_task_authorize(
 # Seed data — Phase 5 adds provenance events for each seed entity
 # ---------------------------------------------------------------------------
 def seed_data():
+    """Clean-demo bootstrap: ensure the demo wallet exists, create NOTHING else.
+
+    No agents, mandates, delegations, tasks, approvals, payments, or
+    transactions are ever seeded. The product starts empty; the user builds
+    authority explicitly. Old demo rows are removed via POST /demo/reset
+    (guarded by ALLOW_DEMO_RESET), never by reseeding here.
+    """
     db = SessionLocal()
     try:
-        existing = db.query(models.Agent).count()
-        if existing > 0:
-            return
-        print("[seed] Creating demo data...")
-        now = datetime.now(timezone.utc)
-        # Domains follow seeded mandate semantics (not agent names):
-        # shopping-agent holds the Grocery mandate -> FOOD; travel-agent holds
-        # the Airlines mandate -> TRAVEL; payment-agent is internal machinery.
-        shopping = models.Agent(
-            id="shopping-agent",
-            name="Shopping Agent",
-            description="Handles grocery purchases up to INR 2,000",
-            status="ACTIVE",
-            domain="FOOD",
-            created_at=now - timedelta(days=2),
-        )
-        travel = models.Agent(
-            id="travel-agent",
-            name="Travel Agent",
-            description="Corporate travel booking",
-            status="ACTIVE",
-            domain="TRAVEL",
-            created_at=now - timedelta(days=5),
-        )
-        payment = models.Agent(
-            id="payment-agent",
-            name="Payment Agent",
-            description="Sub-delegated executor for Shopping Agent, Grocery only",
-            status="ACTIVE",
-            domain="OTHER",
-            created_at=now - timedelta(days=1, hours=2),
-        )
-        db.add_all([shopping, travel, payment])
-        db.flush()
-        # Provenance for agents
-        for ag in [shopping, travel, payment]:
-            _record_provenance(db, event_type="AGENT_REGISTERED", actor_agent_id=ag.id, event_data={"name": ag.name})
-
-        mandate_grocery = models.Mandate(
-            id="mnd-4091",
-            agent_id="shopping-agent",
-            purpose="Groceries",
-            max_amount=2000,
-            currency="INR",
-            merchant_category="Grocery",
-            expires_at=now + timedelta(days=30),
-            status="ACTIVE",
-            created_at=now - timedelta(days=1),
-        )
-        mandate_travel = models.Mandate(
-            id="mnd-1108",
-            agent_id="travel-agent",
-            purpose="Flight Booking",
-            max_amount=8000,
-            currency="INR",
-            merchant_category="Airlines",
-            expires_at=now + timedelta(days=60),
-            status="ACTIVE",
-            created_at=now - timedelta(days=3),
-        )
-        db.add_all([mandate_grocery, mandate_travel])
-        db.flush()
-        for m in [mandate_grocery, mandate_travel]:
-            _record_provenance(db, event_type="MANDATE_CREATED", actor_agent_id=m.agent_id, mandate_id=m.id, event_data={"purpose": m.purpose, "max_amount": m.max_amount, "merchant_category": m.merchant_category})
-
-        delegation = models.Delegation(
-            id="del-1001",
-            parent_agent_id="shopping-agent",
-            child_agent_id="payment-agent",
-            parent_mandate_id="mnd-4091",
-            delegated_amount_limit=1000,
-            purpose="Groceries",
-            merchant_category="Grocery",
-            status="ACTIVE",
-            created_at=now - timedelta(hours=12),
-            expires_at=now + timedelta(days=20),
-        )
-        db.add(delegation)
-        db.flush()
-        _record_provenance(
-            db,
-            event_type="DELEGATION_CREATED",
-            actor_agent_id=delegation.child_agent_id,
-            parent_agent_id=delegation.parent_agent_id,
-            mandate_id=delegation.parent_mandate_id,
-            delegation_id=delegation.id,
-            event_data={"delegated_amount_limit": delegation.delegated_amount_limit, "purpose": delegation.purpose, "merchant_category": delegation.merchant_category},
-        )
-
-        tx1 = models.Transaction(
-            id="TX-901923",
-            agent_id="shopping-agent",
-            mandate_id="mnd-4091",
-            amount=820,
-            currency="INR",
-            merchant="ABC Supermarket",
-            merchant_category="Grocery",
-            purpose="Groceries",
-            decision="ALLOW",
-            reason="Payment is within the authorized mandate.",
-            created_at=now - timedelta(hours=2),
-        )
-        tx2 = models.Transaction(
-            id="TX-901844",
-            agent_id="shopping-agent",
-            mandate_id="mnd-4091",
-            amount=3500,
-            currency="INR",
-            merchant="QuickElectro Ltd",
-            merchant_category="Electronics",
-            purpose="Groceries",
-            decision="VERIFY",
-            reason="Amount exceeds authorized limit.",
-            created_at=now - timedelta(hours=3),
-        )
-        tx3 = models.Transaction(
-            id="TX-901712",
-            agent_id="shopping-agent",
-            mandate_id="mnd-4091",
-            amount=640,
-            currency="INR",
-            merchant="FreshDirect",
-            merchant_category="Grocery",
-            purpose="Groceries",
-            decision="ALLOW",
-            reason="Payment is within the authorized mandate.",
-            created_at=now - timedelta(hours=5),
-        )
-        tx4 = models.Transaction(
-            id="TX-901509",
-            agent_id="travel-agent",
-            mandate_id="mnd-1108",
-            amount=7450,
-            currency="INR",
-            merchant="IndiGo Airlines",
-            merchant_category="Airlines",
-            purpose="Flight Booking",
-            decision="ALLOW",
-            reason="Payment is within the authorized mandate.",
-            created_at=now - timedelta(days=1, hours=2),
-        )
-        tx5 = models.Transaction(
-            id="TX-901600",
-            agent_id="payment-agent",
-            mandate_id="mnd-4091",
-            delegation_id="del-1001",
-            amount=800,
-            currency="INR",
-            merchant="ABC Supermarket",
-            merchant_category="Grocery",
-            purpose="Groceries",
-            decision="ALLOW",
-            reason="Payment is within the delegated mandate.",
-            created_at=now - timedelta(hours=1),
-        )
-        db.add_all([tx1, tx2, tx3, tx4, tx5])
-        db.flush()
-        # Provenance for seed transactions — create PAYMENT_REQUESTED + AUTHORIZATION_DECIDED per tx
-        for tx in [tx1, tx2, tx3, tx4, tx5]:
-            _record_provenance(
-                db,
-                event_type="PAYMENT_REQUESTED",
-                actor_agent_id=tx.agent_id,
-                mandate_id=tx.mandate_id,
-                delegation_id=tx.delegation_id,
-                transaction_id=tx.id,
-                event_data={"amount": tx.amount, "merchant": tx.merchant, "merchant_category": tx.merchant_category, "purpose": tx.purpose},
-            )
-            _record_provenance(
-                db,
-                event_type="AUTHORIZATION_DECIDED",
-                actor_agent_id=tx.agent_id,
-                mandate_id=tx.mandate_id,
-                delegation_id=tx.delegation_id,
-                transaction_id=tx.id,
-                decision=tx.decision,
-                reason=tx.reason,
-                event_data={"decision": tx.decision, "reason": tx.reason},
-            )
-            _record_provenance(
-                db,
-                event_type="PAYMENT_COMPLETED",
-                actor_agent_id=tx.agent_id,
-                mandate_id=tx.mandate_id,
-                delegation_id=tx.delegation_id,
-                transaction_id=tx.id,
-                decision=tx.decision,
-                reason=tx.reason,
-                event_data={"merchant": tx.merchant, "decision": tx.decision},
-            )
-
-        db.commit()
-        print("[seed] Demo data created (with delegation del-1001) + provenance events.")
+        _get_wallet(db)
     except Exception as e:
-        db.rollback()
-        print(f"[seed] Error: {e}")
-        raise
+        print(f"[seed] wallet ensure failed: {e}")
     finally:
         db.close()
 
@@ -1127,6 +940,260 @@ def health():
 @app.get("/api/health")
 def health_api():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Demo wallet — backend-owned simulated funds (NOT a bank account)
+#
+# The wallet is the ONLY source of balance truth. The frontend never
+# hardcodes a number. execute_mock_payment debits atomically on success;
+# any failure (auth, approval, balance, revoked, cancelled, expired) leaves
+# the balance untouched. Ledger rows carry balance_after so history and
+# balance always agree.
+# ---------------------------------------------------------------------------
+WALLET_ID = "demo"
+
+
+def _demo_wallet_initial() -> float:
+    try:
+        v = float(os.getenv("DEMO_WALLET_INITIAL", "10000"))
+    except (TypeError, ValueError):
+        v = 10000.0
+    if not v > 0:
+        v = 10000.0
+    return round(v, 2)
+
+
+def _get_wallet(db: Session) -> models.Wallet:
+    wallet = db.query(models.Wallet).filter(models.Wallet.id == WALLET_ID).first()
+    if wallet is not None:
+        return wallet
+    initial = _demo_wallet_initial()
+    now = datetime.now(timezone.utc)
+    wallet = models.Wallet(
+        id=WALLET_ID,
+        balance=initial,
+        currency="INR",
+        total_credited=initial,
+        total_debited=0.0,
+        updated_at=now,
+    )
+    db.add(wallet)
+    db.flush()
+    db.add(
+        models.WalletTransaction(
+            id=models.gen_id("wtx"),
+            direction="CREDIT",
+            kind="INITIAL",
+            amount=initial,
+            currency="INR",
+            balance_after=initial,
+            note="Initial demo funds",
+            created_at=now,
+        )
+    )
+    db.commit()
+    db.refresh(wallet)
+    return wallet
+
+
+def _wallet_to_response(db: Session, wallet: models.Wallet) -> schemas.WalletResponse:
+    count = db.query(models.WalletTransaction).count()
+    return schemas.WalletResponse(
+        balance=float(wallet.balance),
+        currency=wallet.currency,
+        total_credited=float(wallet.total_credited),
+        total_debited=float(wallet.total_debited),
+        transaction_count=count,
+        updated_at=wallet.updated_at,
+    )
+
+
+def _wallet_sufficient_or_raise(
+    db: Session,
+    *,
+    amount: float,
+    merchant: str,
+    agent_id: str | None,
+    task: models.Task | None,
+    payment_id: str,
+) -> models.Wallet:
+    """Balance gate: raises 409 with no mutation when funds are insufficient,
+    after recording a PAYMENT_REJECTED provenance event."""
+    wallet = _get_wallet(db)
+    task_id = task.id if task else None
+    tx_id = task.transaction_id if task else None
+    if wallet.balance < amount - 1e-9:
+        _record_provenance(
+            db,
+            event_type="PAYMENT_REJECTED",
+            actor_agent_id=agent_id,
+            transaction_id=tx_id,
+            reason=(
+                f"AUTHORIZED by the engine but INSUFFICIENT WALLET BALANCE: "
+                f"wallet has ₹{wallet.balance:,.0f}, payment needs ₹{amount:,.0f}. No funds moved."
+            ),
+            event_data={"task_id": task_id, "payment_id": payment_id,
+                        "wallet_balance": float(wallet.balance), "amount": float(amount)},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"AUTHORIZED by the engine but INSUFFICIENT WALLET BALANCE: "
+                f"wallet has ₹{wallet.balance:,.0f}, payment needs ₹{amount:,.0f}. "
+                f"No funds moved — top up demo funds or lower the amount."
+            ),
+        )
+    return wallet
+
+
+def _debit_wallet(
+    db: Session,
+    *,
+    amount: float,
+    merchant: str,
+    agent_id: str | None,
+    task: models.Task | None,
+    payment_id: str,
+) -> models.WalletTransaction:
+    """Debit the demo wallet for an already-validated payment. Re-checks the
+    balance so a debit can never overdraw even if state changed mid-flight."""
+    wallet = _wallet_sufficient_or_raise(
+        db, amount=amount, merchant=merchant, agent_id=agent_id, task=task, payment_id=payment_id
+    )
+    task_id = task.id if task else None
+    tx_id = task.transaction_id if task else None
+    wallet.balance = round(wallet.balance - amount, 2)
+    wallet.total_debited = round(wallet.total_debited + amount, 2)
+    wallet.updated_at = datetime.now(timezone.utc)
+    entry = models.WalletTransaction(
+        id=models.gen_id("wtx"),
+        direction="DEBIT",
+        kind="PAYMENT",
+        amount=float(amount),
+        currency="INR",
+        balance_after=float(wallet.balance),
+        merchant=merchant,
+        agent_id=agent_id,
+        task_id=task_id,
+        payment_id=payment_id,
+    )
+    db.add(entry)
+    db.flush()
+    _record_provenance(
+        db,
+        event_type="WALLET_DEBITED",
+        actor_agent_id=agent_id,
+        transaction_id=tx_id,
+        reason=f"Demo wallet debited ₹{amount:,.0f} to {merchant} — new balance ₹{wallet.balance:,.0f}",
+        event_data={"task_id": task_id, "payment_id": payment_id,
+                    "amount": float(amount), "balance_after": float(wallet.balance)},
+    )
+    return entry
+
+
+@app.get("/wallet", response_model=schemas.WalletResponse)
+def get_wallet(db: Session = Depends(get_db)):
+    return _wallet_to_response(db, _get_wallet(db))
+
+
+@app.get("/api/wallet", response_model=schemas.WalletResponse)
+def get_wallet_api(db: Session = Depends(get_db)):
+    return get_wallet(db)
+
+
+@app.get("/wallet/transactions", response_model=list[schemas.WalletTransactionResponse])
+def list_wallet_transactions(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    from sqlalchemy import text as _text
+
+    _get_wallet(db)
+    # rowid tiebreak: SQLite timestamps have second precision, so rows created
+    # in the same second would otherwise come back in arbitrary order.
+    q = db.query(models.WalletTransaction).order_by(
+        models.WalletTransaction.created_at.desc(), _text("wallet_transactions.rowid DESC")
+    )
+    if offset:
+        q = q.offset(offset)
+    if limit:
+        q = q.limit(min(limit, 200))
+    return q.all()
+
+
+@app.get("/api/wallet/transactions", response_model=list[schemas.WalletTransactionResponse])
+def list_wallet_transactions_api(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    return list_wallet_transactions(limit, offset, db)
+
+
+@app.post("/wallet/topup", response_model=schemas.WalletResponse)
+def topup_wallet(payload: schemas.WalletTopupRequest, db: Session = Depends(get_db)):
+    wallet = _get_wallet(db)
+    amount = round(float(payload.amount), 2)
+    wallet.balance = round(wallet.balance + amount, 2)
+    wallet.total_credited = round(wallet.total_credited + amount, 2)
+    wallet.updated_at = datetime.now(timezone.utc)
+    db.add(
+        models.WalletTransaction(
+            id=models.gen_id("wtx"),
+            direction="CREDIT",
+            kind="TOPUP",
+            amount=amount,
+            currency="INR",
+            balance_after=float(wallet.balance),
+            note="Demo funds added",
+        )
+    )
+    db.commit()
+    db.refresh(wallet)
+    _record_provenance(
+        db,
+        event_type="WALLET_CREDITED",
+        reason=f"Demo funds added ₹{amount:,.0f} — new balance ₹{wallet.balance:,.0f}",
+        event_data={"amount": amount, "balance_after": float(wallet.balance)},
+    )
+    return _wallet_to_response(db, wallet)
+
+
+@app.post("/api/wallet/topup", response_model=schemas.WalletResponse)
+def topup_wallet_api(payload: schemas.WalletTopupRequest, db: Session = Depends(get_db)):
+    return topup_wallet(payload, db)
+
+
+@app.post("/demo/reset", response_model=schemas.DemoResetResponse)
+def demo_reset(db: Session = Depends(get_db)):
+    """Wipe ALL demo state and restart from a clean wallet. Guarded: requires
+    ALLOW_DEMO_RESET=true (set it on the demo backend, never in production
+    with real data). Schema is untouched — only rows are deleted."""
+    if os.getenv("ALLOW_DEMO_RESET", "false").strip().lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Demo reset is disabled (set ALLOW_DEMO_RESET=true to enable).",
+        )
+    deleted: dict[str, int] = {}
+    # Children first (FK-safe: nothing left may reference a deleted row),
+    # provenance last so the chain visibly restarts.
+    for model in (
+        models.WalletTransaction,
+        models.MockPayment,
+        models.Approval,
+        models.IdempotencyRecord,
+        models.Task,
+        models.Transaction,
+        models.Delegation,
+        models.Mandate,
+        models.Agent,
+        models.ProvenanceEvent,
+        models.Wallet,
+    ):
+        n = db.query(model).delete(synchronize_session=False)
+        deleted[model.__tablename__] = n
+    db.commit()
+    wallet = _get_wallet(db)
+    return schemas.DemoResetResponse(reset=True, deleted=deleted, wallet=_wallet_to_response(db, wallet))
+
+
+@app.post("/api/demo/reset", response_model=schemas.DemoResetResponse)
+def demo_reset_api(db: Session = Depends(get_db)):
+    return demo_reset(db)
 
 
 # ---------------------------------------------------------------------------
@@ -1963,8 +2030,19 @@ def resolve_approval_api(approval_id: str, payload: schemas.ApprovalResolveReque
 # PAYMENT_COMPLETED means "authorization decision recorded" and reusing it
 # for simulated success would conflate the two in the audit log.
 # ---------------------------------------------------------------------------
-def _payment_to_response(payment: models.MockPayment) -> schemas.MockPaymentResponse:
-    return schemas.MockPaymentResponse.model_validate(payment)
+def _payment_to_response(db: Session, payment: models.MockPayment) -> schemas.MockPaymentResponse:
+    resp = schemas.MockPaymentResponse.model_validate(payment)
+    entry = (
+        db.query(models.WalletTransaction)
+        .filter(
+            models.WalletTransaction.payment_id == payment.id,
+            models.WalletTransaction.direction == "DEBIT",
+        )
+        .order_by(models.WalletTransaction.created_at.desc())
+        .first()
+    )
+    resp.wallet_balance_after = float(entry.balance_after) if entry else None
+    return resp
 
 
 def _validate_task_for_payment(db: Session, task: models.Task) -> models.Agent:
@@ -2033,7 +2111,7 @@ def create_mock_payment(
         reason=f"Demo payment created: ₹{payment.amount:,.0f} to {payment.merchant} — no real funds transferred",
         event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
     )
-    return _payment_to_response(payment)
+    return _payment_to_response(db, payment)
 
 
 @app.post("/api/mock-payments/create", response_model=schemas.MockPaymentResponse, status_code=201)
@@ -2066,6 +2144,10 @@ def execute_mock_payment(
     # Binding: the payment must still match its task exactly (tamper → reject).
     if float(payment.amount) != float(task.requested_amount) or payment.merchant != task.merchant:
         raise HTTPException(status_code=409, detail="Payment does not match its task")
+    # Wallet gate BEFORE any state change: insufficient funds reject with no
+    # debit and no status change (task stays APPROVED, retry after top-up).
+    _wallet_sufficient_or_raise(db, amount=float(payment.amount), merchant=payment.merchant,
+                                agent_id=task.domain_agent_id, task=task, payment_id=payment.id)
     payment.status = "PROCESSING"
     payment.failure_reason = None
     db.commit()
@@ -2093,10 +2175,20 @@ def execute_mock_payment(
             event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
         )
         db.refresh(payment)
-        return _payment_to_response(payment)
+        return _payment_to_response(db, payment)
     payment.status = "SUCCEEDED"
     payment.completed_at = datetime.now(timezone.utc)
     task.status = "COMPLETED"
+    # Atomic with the status change above: the debit lands in the same commit,
+    # so a completed payment always corresponds to a real wallet debit.
+    _debit_wallet(
+        db,
+        amount=float(payment.amount),
+        merchant=payment.merchant,
+        agent_id=task.domain_agent_id,
+        task=task,
+        payment_id=payment.id,
+    )
     db.commit()
     _record_provenance(
         db,
@@ -2108,7 +2200,7 @@ def execute_mock_payment(
         event_data={"task_id": task.id, "payment_id": payment.id, "simulated": True},
     )
     db.refresh(payment)
-    return _payment_to_response(payment)
+    return _payment_to_response(db, payment)
 
 
 @app.post("/api/mock-payments/{payment_id}/execute", response_model=schemas.MockPaymentResponse)
@@ -2123,7 +2215,7 @@ def get_mock_payment(payment_id: str, db: Session = Depends(get_db)):
     payment = db.query(models.MockPayment).filter(models.MockPayment.id == payment_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
-    return _payment_to_response(payment)
+    return _payment_to_response(db, payment)
 
 
 @app.get("/api/mock-payments/{payment_id}", response_model=schemas.MockPaymentResponse)

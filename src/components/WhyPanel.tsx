@@ -91,6 +91,17 @@ export const WhyPanel: React.FC<WhyPanelProps> = ({
           />
         )}
       </ul>
+      {/* Never mix amount and purpose failures: say exactly which one fired. */}
+      {!approved && hasRule && withinBudget && categoryOk === false && (
+        <p className="text-[13px] text-[#0b1c30] mt-2.5 font-medium">
+          Within your spending limit, but outside the agent&apos;s authorized purpose.
+        </p>
+      )}
+      {!approved && hasRule && withinBudget === false && (
+        <p className="text-[13px] text-[#0b1c30] mt-2.5 font-medium">
+          ₹{requestedAmount.toLocaleString()} exceeds the agent&apos;s ₹{(cap as number).toLocaleString()} per-order authority.
+        </p>
+      )}
       <div className={`mt-2.5 rounded-lg px-3 py-2 text-[13px] ${approved ? 'bg-[#e6f4ee] text-[#0a6b4a]' : 'bg-[#fdecea] text-[#93000a]'}`}>
         <span className="font-semibold">Decision: {approved ? 'APPROVED' : 'NEEDS REVIEW'}</span>
         {reason && <span className="block mt-0.5 text-[12px] opacity-90">{reason}</span>}

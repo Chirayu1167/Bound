@@ -12,6 +12,7 @@
 
 import React, { useMemo } from 'react';
 import type { ActiveTab, AgentNode, ApprovalItem, MockPaymentItem, TaskItem, TransactionRecord } from '../types';
+import type { WalletTx } from '../services/api';
 import { EmptyState, TechnicalDetails, TechRow } from '../components/ui';
 
 interface OrdersViewProps {
@@ -20,6 +21,7 @@ interface OrdersViewProps {
   transactions: TransactionRecord[];
   agents: AgentNode[];
   approvals: ApprovalItem[];
+  walletTxns: WalletTx[];
   onNavigate: (tab: ActiveTab) => void;
 }
 
@@ -38,8 +40,15 @@ const KIND_META: Record<OrderKind, { icon: string; noun: string; simulatedSteps:
   travel: { icon: '✈️', noun: 'Booking', simulatedSteps: ['Confirmed with carrier', 'Check-in opens', 'Boarding', 'Arrived'] },
 };
 
-export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transactions, agents, approvals, onNavigate }) => {
+export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transactions, agents, approvals, walletTxns, onNavigate }) => {
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
+  const balanceByPayment = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const w of walletTxns) {
+      if (w.payment_id) m.set(w.payment_id, w.balance_after);
+    }
+    return m;
+  }, [walletTxns]);
   const approvalByTask = useMemo(() => new Map(approvals.map((a) => [a.task_id, a])), [approvals]);
   const paymentByTask = useMemo(() => {
     const m = new Map<string, MockPaymentItem>();
@@ -71,7 +80,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
           title="No orders or trips yet"
           body="Ask for something on Home — approved requests you pay for will show up here."
           action={
-            <button onClick={() => onNavigate('home')} className="px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer">
+            <button onClick={() => onNavigate('wallet')} className="px-4 py-2 rounded-lg bg-[#0b1c30] text-white text-[13px] font-medium hover:opacity-90 cursor-pointer">
               Make a request
             </button>
           }
@@ -87,6 +96,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
             const tx = t.transaction_id ? txById.get(t.transaction_id) || null : null;
             const paid = payment?.status === 'SUCCEEDED';
             const needsReview = t.status === 'NEEDS_REVIEW';
+            const bal = payment ? (payment.wallet_balance_after ?? balanceByPayment.get(payment.id) ?? null) : null;
             return (
               <div key={t.id} className="rounded-xl bg-white border border-[#e2e3e8] p-4">
                 <div className="flex items-start justify-between gap-3">
@@ -113,7 +123,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ tasks, payments, transac
                     label={approval ? (approval.status === 'APPROVED' ? 'Approval granted' : approval.status === 'DENIED' ? 'Approval denied' : 'Approval waiting') : needsReview ? 'No approval available' : 'No approval needed'}
                     sub={approval ? `One-time · ${approval.status.toLowerCase()}` : needsReview ? 'Outside the rule — see Activity' : 'Within your rule'}
                   />
-                  <Step done={paid} current={!paid} label={paid ? 'Payment completed (demo)' : payment ? `Payment ${payment.status.toLowerCase()} (demo)` : 'Not paid yet'} sub={paid && payment?.completed_at ? new Date(payment.completed_at).toLocaleString() : undefined} />
+                  <Step done={paid} current={!paid} label={paid ? 'Payment completed (demo)' : payment ? `Payment ${payment.status.toLowerCase()} (demo)` : 'Not paid yet'} sub={paid ? `${payment?.completed_at ? `${new Date(payment.completed_at).toLocaleString()} · ` : ''}${bal != null ? `Balance ₹${bal.toLocaleString()}` : ''}` : payment?.completed_at ? new Date(payment.completed_at).toLocaleString() : undefined} />
                 </ol>
 
                 <div className="mt-3 rounded-lg border border-dashed border-[#c6c6cd] bg-[#fafbff] px-3 py-2.5">
